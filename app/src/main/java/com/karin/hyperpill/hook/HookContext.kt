@@ -69,6 +69,23 @@ object Log {
     @Volatile
     var prefs: SharedPreferences? = null
 
+    /**
+     * Diagnostic channel that bypasses the user-configurable log level gate.
+     *
+     * The regular channel drops Log.i/Log.d below LOG_LEVEL_DEBUG, so at the default
+     * "Normal" setting every hook-installation and connection line disappears exactly
+     * when they are needed for troubleshooting. These lines always go to logcat.
+     */
+    const val DIAG_TAG = "HyperPILL"
+
+    fun diag(message: String) {
+        android.util.Log.i(DIAG_TAG, message)
+    }
+
+    fun diag(message: String, throwable: Throwable) {
+        android.util.Log.e(DIAG_TAG, message, throwable)
+    }
+
     private fun refreshLevel() {
         prefs?.let { ConfigManager.refreshFromPrefs(it) }
     }

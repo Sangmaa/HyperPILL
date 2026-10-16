@@ -16,6 +16,7 @@ class HookEntry : XposedModule() {
     private val configListeners = mutableListOf<SharedPreferences.OnSharedPreferenceChangeListener>()
 
     override fun onPackageLoaded(param: PackageLoadedParam) {
+        android.util.Log.i(tag, "onPackageLoaded package=${param.packageName} first=${param.isFirstPackage}")
         if (!param.isFirstPackage) return
 
         when (param.packageName) {
@@ -44,6 +45,7 @@ class HookEntry : XposedModule() {
     }
 
     private fun loadHook(hook: HookContext, classLoader: ClassLoader, packageName: String) {
+        android.util.Log.i(tag, "loadHook package=$packageName hook=${hook.javaClass.simpleName}")
         Log.module = this
         Log.prefs = getRemotePreferences(ConfigManager.PREFS_NAME)
         hook.module = this

@@ -44,6 +44,95 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     private var client: PillClient? = null
     private var pendingFeatures: List<GaiaFeature> = emptyList()
 
+    /**
+     * While the system-side controller owns the RFCOMM session, this screen has no socket
+     * of its own and therefore no frames to show. Listening to the broadcast mirror keeps
+     * the battery readout and the connected/disconnected state live without competing for
+     * the SPP channel.
+     */
+    private var mirrorReceiver: android.content.BroadcastReceiver? = null
+
+    fun startMirroringSystemSession() {
+        if (mirrorReceiver != null) return
+        val ctx = getApplication<Application>()
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
+                when (intent?.action) {
+                    com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_BATTERY_CHANGED -> {
+                        adoptSystemSessionIfAny()
+                        applyBroadcastBattery(intent)
+                    }
+                    com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_DISCONNECTED -> {
+                        com.karin.hyperpill.hook.Log.diag("[ViewModel] mirror saw disconnect, clearing UI")
+                        client = null
+                        _uiState.update {
+                            it.copy(
+                                connected = false,
+                                selectedDevice = null,
+                                batteryLevels = emptyMap(),
+                                message = "已断开"
+                            )
+                        }
+                    }
+                    com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_CONNECTED -> {
+                        adoptSystemSessionIfAny()
+                    }
+                }
+            }
+        }
+        ctx.registerReceiver(
+            receiver,
+            android.content.IntentFilter().apply {
+                addAction(com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_BATTERY_CHANGED)
+                addAction(com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_CONNECTED)
+                addAction(com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_DISCONNECTED)
+            },
+            // Required from Android 14 (API 34) on: a runtime-registered receiver for a
+            // non-system action must declare its export behaviour or registerReceiver
+            // throws SecurityException. This runs from MainActivity.onCreate, so the
+            // omission did not merely lose battery updates -- it killed the process on
+            // every launch and left the UI unable to show that a session was already up.
+            // Exported: these broadcasts are sent by the hooked bluetooth host, which runs
+            // under a different uid, so a not-exported receiver would never see them.
+            android.content.Context.RECEIVER_EXPORTED
+        )
+        mirrorReceiver = receiver
+        adoptSystemSessionIfAny()
+    }
+
+    fun stopMirroringSystemSession() {
+        mirrorReceiver?.let { runCatching { getApplication<Application>().unregisterReceiver(it) } }
+        mirrorReceiver = null
+    }
+
+    /**
+     * Maps the broadcast's per-pod percentages onto the same keys [PillClient] frames use,
+     * so the UI renders system-sourced battery identically to locally-read battery.
+     * The extras are emitted by PillSystemController.sendBatteryBroadcast as
+     * <pod>_battery / <pod>_connected, and absent pods are sent as 0/false.
+     */
+    private fun applyBroadcastBattery(intent: android.content.Intent) {
+        val levels = linkedMapOf<Int, Int>()
+        fun record(extraBattery: String, extraConnected: String, key: Int) {
+            if (!intent.getBooleanExtra(extraConnected, false)) return
+            levels[key] = intent.getIntExtra(extraBattery, 0)
+        }
+        record("left_battery", "left_connected", GaiaProtocol.BATTERY_LEFT)
+        record("right_battery", "right_connected", GaiaProtocol.BATTERY_RIGHT)
+        // Single-pod devices surface one aggregate level instead of left/right; without
+        // this the UI showed a connected device with no battery reading at all.
+        if (levels.isEmpty()) {
+            record("single_battery", "single_connected", GaiaProtocol.BATTERY_SINGLE_DEVICE)
+        }
+        if (levels.isEmpty()) return
+        _uiState.update { it.copy(batteryLevels = levels, connected = true, busy = false) }
+    }
+
+    override fun onCleared() {
+        stopMirroringSystemSession()
+        super.onCleared()
+    }
+
     fun refreshDevices() {
         _uiState.update { it.copy(refreshingDevices = true) }
         val adapter = BluetoothAdapter.getDefaultAdapter() ?: run {
@@ -61,6 +150,35 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
                 refreshingDevices = false
             )
         }
+        adoptSystemSessionIfAny(pills)
+    }
+
+    /**
+     * Mirrors an already-live system-side session into the UI.
+     *
+     * The module connects on its own as soon as the headset comes up, so opening the app
+     * during a normal connection used to show "not connected" and require a manual tap
+     * purely because the UI never looked at the session that already exists. Adopting it
+     * here keeps the screen honest and removes the pointless tap.
+     */
+    private fun adoptSystemSessionIfAny(pills: List<BluetoothDevice> = _uiState.value.devices) {
+        val live = pills.firstOrNull {
+            com.karin.hyperpill.pods.PillSystemController.isConnectedTo(it.address)
+        } ?: return
+        com.karin.hyperpill.hook.Log.diag("[ViewModel] adopting live system session for ${live.address}")
+        _uiState.update {
+            it.copy(
+                selectedDevice = live,
+                connected = true,
+                busy = false,
+                message = "已连接 ${live.name}"
+            )
+        }
+    }
+
+    /** Re-syncs UI state with the system controller whenever the screen is shown. */
+    fun syncWithSystemSession() {
+        adoptSystemSessionIfAny()
     }
 
     fun spoofDevice(name: String?) {
@@ -68,6 +186,24 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun connect(device: BluetoothDevice) {
+        // PillSystemController is an in-process singleton, so the hooked bluetooth host
+        // and this UI process each own an independent instance and an independent RFCOMM
+        // socket for the same SPP UUID. Opening a second one tears down whichever session
+        // got there first ("read failed, socket might closed"), which is the long-standing
+        // "first connect fails, tap again to succeed" symptom. When the system side already
+        // holds the session, reuse it and drive commands through it instead of racing it.
+        if (com.karin.hyperpill.pods.PillSystemController.isConnectedTo(device.address)) {
+            com.karin.hyperpill.hook.Log.diag("[ViewModel] system controller already holds ${device.address}, reusing it")
+            _uiState.update {
+                it.copy(
+                    selectedDevice = device,
+                    connected = true,
+                    busy = false,
+                    message = "已连接 ${device.name}"
+                )
+            }
+            return
+        }
         if (_uiState.value.connected) return
         _uiState.update { it.copy(selectedDevice = device, busy = true, message = "正在连接 ${device.name}...") }
         viewModelScope.launch(Dispatchers.IO) {
@@ -114,8 +250,18 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun disconnect() {
+        // Releasing a session that belongs to the system-side controller would tear down
+        // the very socket feeding the notification centre and the focus island; only the
+        // UI-owned client is ours to close. The system session ends on its own when the
+        // headset actually disconnects.
+        val ownsSocket = client != null
+        if (!ownsSocket) {
+            com.karin.hyperpill.hook.Log.diag("[ViewModel] disconnect() without an owned socket, leaving system session alone")
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            client?.close()
+            if (ownsSocket) {
+                client?.close()
+            }
             client = null
             pendingFeatures = emptyList()
             _uiState.update {
@@ -138,8 +284,24 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Controls below drive the GAIA channel through this screen's own client. When the
+     * system controller owns the RFCOMM socket there is no local client, and silently
+     * returning would make every switch look broken, so surface the reason instead.
+     */
+    private fun requireLocalClient(): PillClient? {
+        val c = client
+        if (c == null) {
+            com.karin.hyperpill.hook.Log.diag("[ViewModel] no local client; system controller owns the session")
+            _uiState.update {
+                it.copy(message = "该设置需要 App 直连，请先断开系统连接后在 App 内连接")
+            }
+        }
+        return c
+    }
+
     fun refreshBattery() {
-        val c = client ?: return
+        val c = requireLocalClient() ?: return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { c.requestBatteryLevels() }
                 .onFailure { _uiState.update { it.copy(message = "刷新电量失败: ${it.message}") } }
@@ -147,7 +309,7 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setGain(index: Int) {
-        val c = client ?: return
+        val c = requireLocalClient() ?: return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { c.setGain(index) }
                 .onSuccess { _uiState.update { it.copy(gainIndex = index, message = "增益已设为 $index") } }
@@ -156,7 +318,7 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun selectEqSet(presetId: Int) {
-        val c = client ?: return
+        val c = requireLocalClient() ?: return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { c.setEqSet(presetId) }
                 .onSuccess { _uiState.update { it.copy(eqSelected = presetId, message = "EQ 已切换为 $presetId") } }
@@ -165,7 +327,7 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setOneBringTwoState(enabled: Boolean) {
-        val c = client ?: return
+        val c = requireLocalClient() ?: return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { c.setOneBringTwoState(enabled) }
                 .onSuccess { _uiState.update { it.copy(oneBringTwoEnabled = enabled, message = if (enabled) "双设备连接已开启" else "双设备连接已关闭") } }
@@ -174,7 +336,7 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setOneBringTwoTimeout(timeout: Int) {
-        val c = client ?: return
+        val c = requireLocalClient() ?: return
         viewModelScope.launch(Dispatchers.IO) {
             runCatching { c.setOneBringTwoTimeout(timeout) }
                 .onSuccess { _uiState.update { it.copy(oneBringTwoTimeout = timeout, message = "双设备超时已设为 $timeout") } }
@@ -183,7 +345,7 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setVoiceEnabled(enabled: Boolean) {
-        val c = client ?: return
+        val c = requireLocalClient() ?: return
         val current = _uiState.value.voiceConf
         val volume = current?.volume ?: 100
         val index = current?.index ?: 0
@@ -202,7 +364,7 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setVoiceVolume(volume: Int) {
-        val c = client ?: return
+        val c = requireLocalClient() ?: return
         val current = _uiState.value.voiceConf
         val enabled = current?.enabled ?: true
         val index = current?.index ?: 0

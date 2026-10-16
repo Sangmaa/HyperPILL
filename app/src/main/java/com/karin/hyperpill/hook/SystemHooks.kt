@@ -20,35 +20,80 @@ object HeadsetStateDispatcher : HookContext() {
     private const val TAG = "HyperPILL-HeadsetState"
 
     override fun onHook() {
-        Log.i(TAG, "hook ready package=$packageName")
-        probe("com.android.bluetooth.a2dp.A2dpService")
+        Log.diag("[HeadsetState] onHook package=$packageName")
+
+        // Enumerate what A2dpService actually exposes so a mismatch is visible in the log
+        // instead of failing silently inside runCatching.
+        runCatching {
+            val cls = findClass("com.android.bluetooth.a2dp.A2dpService")
+            Log.diag("[HeadsetState] A2dpService found, ${cls.declaredMethods.size} declared methods")
+            cls.declaredMethods
+                .filter { it.name.contains("ConnectionState", ignoreCase = true) }
+                .forEach { m ->
+                    Log.diag("[HeadsetState]   candidate: ${m.name}(${m.parameterTypes.joinToString { it.simpleName }})")
+                }
+        }.onFailure {
+            Log.diag("[HeadsetState] A2dpService NOT VISIBLE: ${it}", it)
+        }
+
+        val method = runCatching {
+            findMethodByParamCount("com.android.bluetooth.a2dp.A2dpService", "handleConnectionStateChanged", 3)
+        }.getOrNull()
+
+        if (method == null) {
+            Log.diag("[HeadsetState] FATAL: handleConnectionStateChanged(3 args) not found — auto-connect is dead")
+            return
+        }
+        Log.diag("[HeadsetState] target method = ${method.name}(${method.parameterTypes.joinToString { it.simpleName }})")
 
         runCatching {
-            hookAfter(findMethodByParamCount("com.android.bluetooth.a2dp.A2dpService", "handleConnectionStateChanged", 3)) {
+            hookAfter(method) {
                 val device = args.getOrNull(0) as? android.bluetooth.BluetoothDevice
-                val fromState = args.getOrNull(1) as? Int ?: return@hookAfter
-                val currState = args.getOrNull(2) as? Int ?: return@hookAfter
-                if (device == null || currState == fromState) return@hookAfter
+                val fromState = args.getOrNull(1) as? Int
+                val currState = args.getOrNull(2) as? Int
+                Log.diag("[HeadsetState] A2DP state changed from=$fromState to=$currState dev=${device?.address} name=${runCatching { device?.name }.getOrNull()}")
 
-                val context = instance as? android.content.ContextWrapper ?: return@hookAfter
+                if (device == null || fromState == null || currState == null) {
+                    Log.diag("[HeadsetState]   -> args unusable, skipping")
+                    return@hookAfter
+                }
+                if (currState == fromState) return@hookAfter
+
+                val context = instance as? android.content.ContextWrapper
+                if (context == null) {
+                    Log.diag("[HeadsetState]   -> instance ${instance?.javaClass?.name} is not a ContextWrapper")
+                    return@hookAfter
+                }
                 val isPill = isPillDevice(device)
-                Log.i(TAG, "A2DP state $fromState->$currState device=${device.address} isPill=$isPill")
-
+                Log.diag("[HeadsetState]   -> isPill=$isPill")
                 if (!isPill) return@hookAfter
 
                 when (currState) {
-                    android.bluetooth.BluetoothHeadset.STATE_CONNECTED -> {
+                    // Compare against BluetoothProfile's state space, NOT BluetoothHeadset.
+                    // BluetoothHeadset only declares the audio-state constants
+                    // (STATE_AUDIO_*, 10..12); its STATE_CONNECTED is inherited from the
+                    // implemented BluetoothProfile interface and equals 2. A2dpService,
+                    // however, reports the profile state machine of this handset, where a
+                    // finished connection arrives as STATE_CONNECTING (1) and never as 2 --
+                    // so testing against 2 silently dropped every connect. Observed on
+                    // HyperOS 4: "A2DP state changed from=0 to=1", hook fired, isPill=true,
+                    // and then nothing, because neither branch matched.
+                    android.bluetooth.BluetoothProfile.STATE_CONNECTED,
+                    android.bluetooth.BluetoothProfile.STATE_CONNECTING -> {
+                        Log.diag("[HeadsetState]   -> PillSystemController.connect()")
                         com.karin.hyperpill.pods.PillSystemController.connect(context, device)
                     }
-                    android.bluetooth.BluetoothHeadset.STATE_DISCONNECTING,
-                    android.bluetooth.BluetoothHeadset.STATE_DISCONNECTED -> {
+                    android.bluetooth.BluetoothProfile.STATE_DISCONNECTING,
+                    android.bluetooth.BluetoothProfile.STATE_DISCONNECTED -> {
+                        Log.diag("[HeadsetState]   -> PillSystemController.disconnect()")
                         com.karin.hyperpill.pods.PillSystemController.disconnect(context, device)
                     }
+                    else -> Log.diag("[HeadsetState]   -> unhandled state $currState, ignoring")
                 }
             }
-            Log.i(TAG, "A2dpService.handleConnectionStateChanged hook installed")
+            Log.diag("[HeadsetState] hook INSTALLED on A2dpService.handleConnectionStateChanged")
         }.onFailure {
-            Log.w(TAG, "A2dpService.handleConnectionStateChanged hook failed", it)
+            Log.diag("[HeadsetState] hook FAILED: ${it}", it)
         }
     }
 
@@ -250,7 +295,12 @@ object BluetoothUpstreamHeadsetHook : HookContext() {
         return com.karin.hyperpill.pods.BatteryParams(
             left = pod("left_battery", "left_connected"),
             right = pod("right_battery", "right_connected"),
-            case = pod("case_battery", "case_connected")
+            case = pod("case_battery", "case_connected"),
+            // Single-pod devices (one earbud, or a headset exposing one aggregate level)
+            // report through their own extras. Without this mapping the level was
+            // transmitted but silently dropped, and such a device rendered as connected
+            // with no percentage anywhere.
+            single = pod("single_battery", "single_connected")
         )
     }
 
@@ -504,7 +554,12 @@ object MiLinkServiceHook : HookContext() {
         return com.karin.hyperpill.pods.BatteryParams(
             left = pod("left_battery", "left_connected"),
             right = pod("right_battery", "right_connected"),
-            case = pod("case_battery", "case_connected")
+            case = pod("case_battery", "case_connected"),
+            // Single-pod devices (one earbud, or a headset exposing one aggregate level)
+            // report through their own extras. Without this mapping the level was
+            // transmitted but silently dropped, and such a device rendered as connected
+            // with no percentage anywhere.
+            single = pod("single_battery", "single_connected")
         )
     }
 
@@ -631,26 +686,100 @@ object MiBluetoothToastHook : HookContext() {
     private var connectedAddress: String? = null
     private var islandShownForAddress: String? = null
 
+    /** Guards against registering the same receiver twice when several ctors fire. */
+    private val receiverRegistered = java.util.concurrent.atomic.AtomicBoolean(false)
+
     override fun onHook() {
-        Log.i(TAG, "hook ready package=$packageName")
-        probe("com.android.bluetooth.ble.app.MiuiBluetoothNotificationApi")
-        probe("com.android.bluetooth.ble.app.MiuiBluetoothNotification")
-
-        if (packageName != "com.xiaomi.bluetooth") return
-
-        runCatching {
-            hookConstructorAfter(findConstructorByParamCount("com.android.bluetooth.ble.app.MiuiBluetoothNotification", 2)) {
-                val context = runCatching { getObjectField(instance, "mContext") as? android.content.Context }.getOrNull()
-                if (context == null) return@hookConstructorAfter
-                registerFocusIslandReceiver(context)
+        Log.diag("[MiToast] onHook package=$packageName")
+        listOf(
+            "com.android.bluetooth.ble.app.MiuiBluetoothNotificationApi",
+            "com.android.bluetooth.ble.app.MiuiBluetoothNotification"
+        ).forEach { cn ->
+            val found = runCatching { findClass(cn) }.isSuccess
+            Log.diag("[MiToast] class $cn present=$found")
+            if (found) {
+                runCatching {
+                    findClass(cn).declaredConstructors.forEach { c ->
+                        Log.diag("[MiToast]   ctor(${c.parameterTypes.joinToString { it.simpleName }})")
+                    }
+                    findClass(cn).declaredFields.forEach { f ->
+                        Log.diag("[MiToast]   field ${f.name}: ${f.type.simpleName}")
+                    }
+                }
             }
-            Log.i(TAG, "MiuiBluetoothNotification constructor hook installed")
-        }.onFailure {
-            Log.w(TAG, "MiuiBluetoothNotification constructor hook failed", it)
         }
+
+        if (packageName != "com.xiaomi.bluetooth") {
+            Log.diag("[MiToast] wrong package ($packageName), receiver not registered here")
+            return
+        }
+
+        // HyperOS 4 changed which constructor the Bluetooth stack actually uses. The class
+        // still exposes both a (Context, Looper) and a (Looper, BluetoothHeadsetService)
+        // constructor, but only the latter is invoked at runtime. Selecting by parameter
+        // COUNT alone therefore picked the constructor that is never called, so the island
+        // receiver silently never registered and no notification channel was ever created.
+        // Hook every declared constructor instead of guessing which one the current OS uses.
+        val notificationClass = runCatching {
+            findClass("com.android.bluetooth.ble.app.MiuiBluetoothNotification")
+        }.getOrNull()
+        if (notificationClass == null) {
+            Log.diag("[MiToast] FATAL: MiuiBluetoothNotification missing — island receiver will never register")
+            return
+        }
+
+        val installedSignatures = mutableListOf<String>()
+        notificationClass.declaredConstructors.forEach { ctor ->
+            val signature = ctor.parameterTypes.joinToString { it.simpleName }
+            runCatching {
+                ctor.isAccessible = true
+                hookConstructorAfter(ctor) {
+                    onNotificationConstructed(signature, instance)
+                }
+                installedSignatures.add(signature)
+            }.onFailure {
+                Log.diag("[MiToast] constructor hook FAILED for ($signature): ${it}", it)
+            }
+        }
+        if (installedSignatures.isEmpty()) {
+            Log.diag("[MiToast] FATAL: no constructor could be hooked — island receiver will never register")
+            return
+        }
+        Log.diag("[MiToast] constructor hooks INSTALLED for: ${installedSignatures.joinToString()}")
+    }
+
+    /**
+     * Resolves a usable Context from a freshly constructed MiuiBluetoothNotification.
+     *
+     * The (Looper, BluetoothHeadsetService) constructor used on HyperOS 4 takes no Context,
+     * so mContext can still be null right after construction; fall back to the Bluetooth
+     * service that owns this notification when that happens.
+     */
+    private fun resolveContextFrom(instance: Any?): android.content.Context? {
+        (runCatching { getObjectField(instance, "mContext") }.getOrNull() as? android.content.Context)
+            ?.let { return it }
+        val headsetService = runCatching { getObjectField(instance, "mBluetoothHeadsetService") }.getOrNull()
+        ((headsetService as? java.lang.ref.WeakReference<*>)?.get() ?: headsetService)
+            ?.let { return it as? android.content.Context }
+        return null
+    }
+
+    private fun onNotificationConstructed(signature: String, instance: Any?) {
+        Log.diag("[MiToast] ctor FIRED ($signature)")
+        val context = resolveContextFrom(instance)
+        if (context == null) {
+            Log.diag("[MiToast] ctor ($signature) has no usable Context yet — receiver not registered")
+            return
+        }
+        Log.diag("[MiToast] ctor ($signature) → Context=${context.packageName}, registering receiver")
+        registerFocusIslandReceiver(context)
     }
 
     private fun registerFocusIslandReceiver(context: android.content.Context) {
+        if (!receiverRegistered.compareAndSet(false, true)) {
+            Log.diag("[MiToast] receiver already registered — skipping duplicate on ${context.packageName}")
+            return
+        }
         val filter = android.content.IntentFilter().apply {
             addAction(com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_CONNECTED)
             addAction(com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_DISCONNECTED)
@@ -658,42 +787,73 @@ object MiBluetoothToastHook : HookContext() {
         }
         context.registerReceiver(object : android.content.BroadcastReceiver() {
             override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
+                Log.diag("[MiToast] RX ${intent?.action}")
                 when (intent?.action) {
                     com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_CONNECTED -> {
                         connectedAddress = intent.getStringExtra("address")
                         islandShownForAddress = null
-                        Log.i(TAG, "connected address=$connectedAddress, reset island")
+                        Log.diag("[MiToast] connected address=$connectedAddress, island reset")
                     }
                     com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_DISCONNECTED -> {
+                        Log.diag("[MiToast] disconnected address=${intent.getStringExtra("address")}, clearing state")
                         connectedAddress = null
                         islandShownForAddress = null
                         val ctx = context ?: return@onReceive
                         com.karin.hyperpill.utils.HyperPillNotificationUtil.cancelPodsNotification(ctx, intent.getStringExtra("address"))
+                        // The island is separate from the pods notification and would
+                        // otherwise stay until its own delayed cancel fires.
+                        com.karin.hyperpill.utils.FocusIslandUtil.dismissBatteryIsland(ctx)
                     }
                     com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_BATTERY_CHANGED -> {
                         val address = intent.getStringExtra("address") ?: connectedAddress
-                        if (address == null || address != connectedAddress) return@onReceive
+                        Log.diag("[MiToast] battery evt addr=$address connectedAddress=$connectedAddress")
+                        // ACTION_PODS_CONNECTED is only sent at the instant a session is
+                        // established. Whenever this receiver registers later than that --
+                        // after a process restart, an APK update, or a module reload -- it
+                        // never sees the connected broadcast, so connectedAddress stays null
+                        // and every subsequent battery event is dropped here. The battery
+                        // event carries the same address, so adopt it instead of discarding
+                        // the only signal we get. A genuinely different device still needs an
+                        // explicit reconnect, which the mismatch branch below covers once an
+                        // address has been adopted.
+                        if (address == null) {
+                            Log.diag("[MiToast]   -> no address on event and none known, dropping")
+                            return@onReceive
+                        }
+                        if (connectedAddress == null) {
+                            connectedAddress = address
+                            islandShownForAddress = null
+                            Log.diag("[MiToast]   -> adopted address=$address (connected broadcast was missed)")
+                        }
+                        if (address != connectedAddress) {
+                            Log.diag("[MiToast]   -> address mismatch, dropping")
+                            return@onReceive
+                        }
                         val ctx = context ?: return@onReceive
                         val battery = batteryFromIntent(intent)
                         val device = runCatching {
                             @Suppress("DEPRECATION")
                             intent.getParcelableExtra<android.bluetooth.BluetoothDevice>("device")
                         }.getOrNull()
+                        Log.diag("[MiToast]   -> L=${battery.left?.battery} R=${battery.right?.battery} C=${battery.case?.battery} device=${device != null}")
                         device?.let {
                             com.karin.hyperpill.utils.HyperPillNotificationUtil.showPodsNotification(ctx, it, battery)
                         }
                         if (islandShownForAddress != address) {
                             val deviceName = runCatching { device?.alias ?: device?.name }.getOrNull()
-                            if (com.karin.hyperpill.utils.FocusIslandUtil.showBatteryIsland(ctx, battery, deviceName)) {
+                            val ok = com.karin.hyperpill.utils.FocusIslandUtil.showBatteryIsland(ctx, battery, deviceName)
+                            Log.diag("[MiToast]   -> island result=$ok")
+                            if (ok) {
                                 islandShownForAddress = address
-                                Log.i(TAG, "focus island shown for $address")
                             }
+                        } else {
+                            Log.diag("[MiToast]   -> island already shown for $address")
                         }
                     }
                 }
             }
         }, filter, android.content.Context.RECEIVER_EXPORTED)
-        Log.i(TAG, "focus island receiver registered")
+        Log.diag("[MiToast] focus island receiver REGISTERED on ${context.packageName}")
     }
 
     private fun batteryFromIntent(intent: android.content.Intent): com.karin.hyperpill.pods.BatteryParams {
@@ -705,7 +865,12 @@ object MiBluetoothToastHook : HookContext() {
         return com.karin.hyperpill.pods.BatteryParams(
             left = pod("left_battery", "left_connected"),
             right = pod("right_battery", "right_connected"),
-            case = pod("case_battery", "case_connected")
+            case = pod("case_battery", "case_connected"),
+            // Single-pod devices (one earbud, or a headset exposing one aggregate level)
+            // report through their own extras. Without this mapping the level was
+            // transmitted but silently dropped, and such a device rendered as connected
+            // with no percentage anywhere.
+            single = pod("single_battery", "single_connected")
         )
     }
 }
@@ -849,9 +1014,9 @@ object HeadSetsDetailHook : HookContext() {
 private fun HookContext.probe(className: String) {
     runCatching { findClass(className) }
         .onSuccess {
-            Log.i("HyperPILL-Probe", "class found in $packageName: $className")
+            Log.diag("[Probe] FOUND in $packageName: $className")
         }
         .onFailure {
-            Log.w("HyperPILL-Probe", "class NOT found in $packageName: $className")
+            Log.diag("[Probe] NOT FOUND in $packageName: $className (${it.javaClass.simpleName})")
         }
 }

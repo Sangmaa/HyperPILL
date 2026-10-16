@@ -22,8 +22,33 @@ object HyperPillNotificationUtil {
     private const val NOTIFICATION_ID = 10003
     private const val NOTIFICATION_TAG_PREFIX = "HyperPILL"
 
+    /**
+     * This notification is posted from inside the Bluetooth host process, so the permission
+     * that actually matters is the host package's (e.g. com.xiaomi.bluetooth), not the module's.
+     * Warn loudly instead of failing silently so the missing permission is traceable in logs.
+     */
+    @SuppressLint("NotificationPermission")
+    private fun hasNotificationPermission(context: Context): Boolean {
+        val granted = context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            Log.diag("[Notification] ABORT: POST_NOTIFICATIONS not granted for host ${context.packageName}")
+        }
+        return granted
+    }
+
     fun showPodsNotification(context: Context, device: BluetoothDevice, battery: BatteryParams) {
-        val address = runCatching { device.address }.getOrNull() ?: return
+        // Reading the address can throw on newer Android releases when the caller process is
+        // not the device owner. Returning silently here was why a missing notification left no
+        // trace at all in logcat; log the reason instead.
+        val address = runCatching { device.address }.getOrElse {
+            Log.diag("[Notification] ABORT: cannot read device address: ${it}")
+            return
+        } ?: run {
+            Log.diag("[Notification] ABORT: device address is null")
+            return
+        }
+        if (!hasNotificationPermission(context)) return
         val alias = runCatching { device.alias ?: device.name }.getOrNull() ?: address
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
@@ -82,9 +107,9 @@ object HyperPillNotificationUtil {
 
         runCatching {
             nm.notifyAsUser("$NOTIFICATION_TAG_PREFIX$address", NOTIFICATION_ID, notification, SystemApisUtils.getUserAllUserHandle())
-            Log.n(TAG, "pods notification shown $alias $contentText")
+            Log.diag("[Notification] posted alias=$alias text=$contentText")
         }.onFailure {
-            Log.w(TAG, "pods notification failed", it)
+            Log.diag("[Notification] post FAILED: ${it}", it)
         }
     }
 
@@ -104,6 +129,11 @@ object HyperPillNotificationUtil {
         battery.left?.takeIf { it.isConnected }?.let { parts.add("L ${it.battery}%") }
         battery.right?.takeIf { it.isConnected }?.let { parts.add("R ${it.battery}%") }
         battery.case?.takeIf { it.isConnected }?.let { parts.add("C ${it.battery}%") }
+        // A single-pod device reports no left/right, so without this the text fell through
+        // to the "已连接" placeholder and the percentage never reached the user.
+        if (parts.isEmpty()) {
+            battery.single?.takeIf { it.isConnected }?.let { parts.add("${it.battery}%") }
+        }
         return parts.joinToString("  ").ifBlank { "已连接" }
     }
 

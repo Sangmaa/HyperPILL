@@ -23,13 +23,31 @@ object FocusIslandUtil {
     private const val MODULE_PACKAGE = "com.karin.hyperpill"
     private const val DISMISS_DELAY_MS = 4000L
 
+    /** Called from the Bluetooth host process, so check that host's permission, not the module's. */
+    @SuppressLint("NotificationPermission")
     fun showBatteryIsland(context: Context, battery: BatteryParams, deviceName: String?): Boolean {
         try {
+            val granted = context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            Log.diag("[Island] showBatteryIsland host=${context.packageName} notifGranted=$granted " +
+                    "L=${battery.left?.battery} R=${battery.right?.battery}")
+            if (!granted) {
+                Log.diag("[Island] ABORT: POST_NOTIFICATIONS not granted for host ${context.packageName}")
+                return false
+            }
             val leftConnected = battery.left?.isConnected == true
             val rightConnected = battery.right?.isConnected == true
-            if (!leftConnected && !rightConnected) return false
+            val singleConnected = battery.single?.isConnected == true
+            // A single-pod device reports one aggregate level and no left/right at all.
+            // It is still worth an island, so present its level in the left slot and leave
+            // the right side blank rather than refusing to draw anything.
+            if (!leftConnected && !rightConnected && !singleConnected) return false
 
-            val leftText = if (leftConnected) "${battery.left!!.battery}" else "-"
+            val leftText = when {
+                leftConnected -> "${battery.left!!.battery}"
+                singleConnected -> "${battery.single!!.battery}"
+                else -> "-"
+            }
             val rightText = if (rightConnected) "${battery.right!!.battery}" else "-"
 
             val moduleContext = context.createPackageContext(
@@ -63,6 +81,7 @@ object FocusIslandUtil {
             val contentParts = mutableListOf<String>()
             if (leftConnected) contentParts.add("L: ${battery.left!!.battery}%")
             if (rightConnected) contentParts.add("R: ${battery.right!!.battery}%")
+            if (contentParts.isEmpty() && singleConnected) contentParts.add("${battery.single!!.battery}%")
             val contentText = contentParts.joinToString("  ")
 
             val extras = FocusNotification.buildV3 {
@@ -127,6 +146,24 @@ object FocusIslandUtil {
         } catch (e: Exception) {
             Log.e(TAG, "Failed to show Focus Island", e)
             return false
+        }
+    }
+
+    /**
+     * Withdraws the battery island immediately instead of waiting out [DISMISS_DELAY_MS].
+     *
+     * The island auto-dismisses a few seconds after it is posted, so a stale one is
+     * usually already gone. This exists for the disconnect path: tearing down the device
+     * while its island is still on screen would otherwise leave the last known percentages
+     * visible until the delayed cancel happens to fire.
+     */
+    fun dismissBatteryIsland(context: Context) {
+        try {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.cancel(NOTIFICATION_ID)
+            Log.diag("[Island] dismissed on disconnect for host ${context.packageName}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to dismiss Focus Island", e)
         }
     }
 }

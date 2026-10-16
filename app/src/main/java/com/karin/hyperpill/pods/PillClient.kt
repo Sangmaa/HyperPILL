@@ -36,9 +36,16 @@ class PillClient(
     fun connect() {
         val s = device.createRfcommSocketToServiceRecord(UUID.fromString(GaiaProtocol.SPP_UUID))
         socket = s
-        s.connect()
+        com.karin.hyperpill.hook.Log.diag("[RFCOMM] connecting to ${device.address} (${runCatching { device.name }.getOrNull()}) uuid=${GaiaProtocol.SPP_UUID}")
+        try {
+            s.connect()
+        } catch (t: Throwable) {
+            com.karin.hyperpill.hook.Log.diag("[RFCOMM] connect() threw ${t.javaClass.simpleName}: ${t.message}", t)
+            throw t
+        }
         input = s.inputStream
         output = s.outputStream
+        com.karin.hyperpill.hook.Log.diag("[RFCOMM] connected to ${device.address}, inputStream+outputStream acquired")
         listener.onConnected()
         startReader()
     }
@@ -133,10 +140,12 @@ class PillClient(
                 }
             } catch (t: Throwable) {
                 if (!closed.get()) {
+                    com.karin.hyperpill.hook.Log.diag("[RFCOMM] reader died: ${t.javaClass.simpleName}: ${t.message}", t)
                     listener.onError(t)
                 }
             } finally {
                 if (!closed.get()) {
+                    com.karin.hyperpill.hook.Log.diag("[RFCOMM] reader exiting, notifying disconnect")
                     listener.onDisconnected()
                 }
             }

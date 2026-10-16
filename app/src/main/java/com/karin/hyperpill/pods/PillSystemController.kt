@@ -43,6 +43,22 @@ object PillSystemController {
     private const val TAG = "HyperPILL-System"
     private const val BATTERY_POLL_INTERVAL_MS = 30_000L
 
+    /**
+     * Packages the pod-state broadcasts are addressed to.
+     *
+     * The module runs in several processes at once, and a broadcast sent with
+     * setPackage(pkg) is only delivered to receivers inside pkg, so every consumer has to
+     * be listed by name. com.karin.hyperpill is the module's own UI process: without it the
+     * activity is never told that a session is already up and keeps showing a disconnected
+     * state until the user taps connect by hand.
+     */
+    private val BROADCAST_TARGETS = listOf(
+        "com.xiaomi.bluetooth",
+        "com.milink.service",
+        "com.android.settings",
+        "com.karin.hyperpill"
+    )
+
     private val connected = AtomicBoolean(false)
     private var context: Context? = null
     private var device: BluetoothDevice? = null
@@ -53,11 +69,32 @@ object PillSystemController {
 
     private val handler = Handler(Looper.getMainLooper())
 
+    /**
+     * True when this process already holds a live RFCOMM session for [address].
+     *
+     * The module is injected into several processes at once (com.android.bluetooth,
+     * com.xiaomi.bluetooth, com.karin.hyperpill, ...). Because this controller is an
+     * in-process singleton rather than a cross-process one, each of them owns an
+     * independent socket for the same SPP UUID; two live sockets evict each other.
+     * Callers use this to detect an existing session and reuse it instead of racing it.
+     */
+    fun isConnectedTo(address: String?): Boolean =
+        address != null && connected.get() && device?.address == address
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 HyperPILLAction.ACTION_REFRESH_STATUS -> {
                     Log.d(TAG, "refresh status requested")
+                    // Re-announce the session before querying. Receivers that hooked in
+                    // after the original connected broadcast (process restart, APK update,
+                    // module reload) would otherwise never learn the address and would drop
+                    // every battery event that follows.
+                    val d = device
+                    if (connected.get() && d != null) {
+                        Log.diag("[Controller] refresh -> re-announcing connected ${d.address}")
+                        sendConnectedBroadcast(d)
+                    }
                     queryBattery()
                 }
             }
@@ -66,10 +103,12 @@ object PillSystemController {
 
     @Synchronized
     fun connect(context: Context, device: BluetoothDevice) {
+        Log.diag("[Controller] connect() dev=${device.address} alreadyConnected=${connected.get()} current=${this.device?.address}")
         if (connected.get() && this.device?.address == device.address) {
-            Log.d(TAG, "already connected to ${device.address}")
+            Log.diag("[Controller]   -> already connected, no-op")
             return
         }
+        Log.diag("[Controller]   -> tearing down previous session before reconnect")
         disconnectInternal()
         this.context = context.applicationContext ?: context
         this.device = device
@@ -79,13 +118,16 @@ object PillSystemController {
         sendConnectedBroadcast(device)
 
         val ctx = this.context
-        if (ctx == null) return
+        if (ctx == null) {
+            Log.diag("[Controller]   -> FATAL context null after applicationContext fallback")
+            return
+        }
         val target = device
         Thread {
             try {
                 val c = PillClient(target, object : PillClient.Listener {
                     override fun onConnected() {
-                        Log.n(TAG, "RFCOMM connected ${target.address}")
+                        Log.diag("[Controller] RFCOMM connected ${target.address}, querying battery")
                         queryBattery()
                     }
 
@@ -94,18 +136,22 @@ object PillSystemController {
                     }
 
                     override fun onError(throwable: Throwable) {
-                        Log.w(TAG, "RFCOMM error: ${throwable.message}", throwable)
+                        Log.diag("[Controller] RFCOMM error: ${throwable.message}", throwable)
+                        // connected is set optimistically before the socket exists, so a
+                        // failed attempt would otherwise leave it stuck true and make every
+                        // later connect() a no-op. Clear it so the next trigger can retry.
+                        disconnectInternal()
                     }
 
                     override fun onDisconnected() {
-                        Log.n(TAG, "RFCOMM disconnected ${target.address}")
+                        Log.diag("[Controller] RFCOMM disconnected ${target.address}")
                         disconnectInternal()
                     }
                 })
                 client = c
                 c.connect()
             } catch (t: Throwable) {
-                Log.e(TAG, "RFCOMM connect failed: ${t.message}", t)
+                Log.diag("[Controller] RFCOMM connect FAILED: ${t.javaClass.simpleName}: ${t.message}", t)
             }
         }.apply {
             name = "HyperPILL-System-RFCOMM"
@@ -117,11 +163,34 @@ object PillSystemController {
 
     @Synchronized
     fun disconnect(context: Context?, device: BluetoothDevice?) {
-        if (device != null && this.device?.address != device.address) return
+        // A dropped RFCOMM stream tears the session down on its own (onError ->
+        // disconnectInternal), which clears this.device. The headset then reports its
+        // A2DP disconnect a few seconds later, and a guard of the form
+        // "this.device?.address != device.address" evaluates null != address -> true and
+        // returns early, so the pods_disconnected broadcast is never sent and the
+        // notification plus focus island stay on screen forever. Only skip when a
+        // *different* device is still actively connected.
+        val current = this.device
+        if (device != null && current != null && current.address != device.address) {
+            Log.diag("[Controller] disconnect() ignored: ${device.address} != active ${current.address}")
+            return
+        }
+        // Nothing left to tear down, but the host may still be showing the last battery
+        // state from a session that already ended. Emit the disconnect anyway so the
+        // receiver withdraws it.
+        if (!connected.get() && current == null) {
+            Log.diag("[Controller] disconnect() after session already cleared, notifying host unconditionally")
+            val ctx = context ?: this.context
+            if (ctx != null && device != null) {
+                sendDisconnectedBroadcast(ctx.applicationContext ?: ctx, device.address, device)
+            }
+            return
+        }
         disconnectInternal(notifyDisconnect = true)
     }
 
     private fun disconnectInternal(notifyDisconnect: Boolean = false) {
+        Log.diag("[Controller] disconnectInternal notify=$notifyDisconnect (client=${client != null} connected=${connected.get()})")
         val oldContext = context
         val oldDevice = device
         connected.set(false)
@@ -148,7 +217,7 @@ object PillSystemController {
             addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
         }
         ctx.sendBroadcast(Intent(base).setPackage(ctx.packageName))
-        listOf("com.xiaomi.bluetooth", "com.milink.service", "com.android.settings").forEach { pkg ->
+        BROADCAST_TARGETS.forEach { pkg ->
             ctx.sendBroadcast(Intent(base).setPackage(pkg))
         }
     }
@@ -227,7 +296,7 @@ object PillSystemController {
             addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
         }
         ctx.sendBroadcast(intent.setPackage(ctx.packageName))
-        listOf("com.xiaomi.bluetooth", "com.milink.service", "com.android.settings").forEach { pkg ->
+        BROADCAST_TARGETS.forEach { pkg ->
             ctx.sendBroadcast(Intent(intent).setPackage(pkg))
         }
     }
@@ -251,7 +320,7 @@ object PillSystemController {
             addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
         }
         ctx.sendBroadcast(Intent(base).setPackage(ctx.packageName))
-        listOf("com.xiaomi.bluetooth", "com.milink.service", "com.android.settings").forEach { pkg ->
+        BROADCAST_TARGETS.forEach { pkg ->
             ctx.sendBroadcast(Intent(base).setPackage(pkg))
         }
     }
