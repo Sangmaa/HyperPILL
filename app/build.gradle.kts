@@ -41,6 +41,19 @@ android {
             optimization {
                 enable = false
             }
+            // Shrinking is opt-in via -Pshrink (see proguard-rules.pro). It is not the
+            // default because this module is loaded reflectively into other apps: the
+            // hook entry points and every class named only in scope/hook configuration
+            // must survive, and a wrong keep rule fails silently at hook-install time
+            // rather than at build time.
+            if (project.hasProperty("shrink")) {
+                isMinifyEnabled = true
+                isShrinkResources = true
+                proguardFiles(
+                    getDefaultProguardFile("proguard-android-optimize.txt"),
+                    "proguard-rules.pro"
+                )
+            }
             signingConfig = if (signingProps != null) {
                 signingConfigs.getByName("release")
             } else {
