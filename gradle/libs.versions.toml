@@ -1,18 +1,18 @@
 [versions]
-agp = "9.3.1"
-coreKtx = "1.19.0"
+agp = "9.4.1"
+coreKtx = "1.19.1"
 junit = "4.13.2"
 junitVersion = "1.1.5"
 espressoCore = "3.5.1"
 lifecycleRuntimeKtx = "2.11.0"
 activityCompose = "1.13.0"
-kotlin = "2.4.10"
-composeBom = "2026.02.01"
+kotlin = "2.4.21"
+composeBom = "2026.09.00"
 libxposedApi = "102.0.0"
 libxposedService = "102.0.0"
-miuix = "0.9.4-rc01"
+miuix = "0.9.4"
 focusApi = "1.4"
-navigationEvent = "1.1.2"
+navigationEvent = "1.2.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }

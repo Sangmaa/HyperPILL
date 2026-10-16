@@ -27,9 +27,19 @@ class MainActivity : ComponentActivity() {
         if (granted) viewModel.refreshDevices()
     }
 
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        android.util.Log.i("HyperPILL", "POST_NOTIFICATIONS granted=$granted")
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        requestNotificationPermissionIfNeeded()
+        // The module usually connects before this screen is ever opened, so the UI starts
+        // mirroring that session instead of waiting for a manual tap.
+        viewModel.startMirroringSystemSession()
         setContent {
             HyperPILLTheme {
                 val state by viewModel.uiState.collectAsState()
@@ -67,6 +77,22 @@ class MainActivity : ComponentActivity() {
                     onSpoofDevice = { viewModel.spoofDevice(it) }
                 )
             }
+        }
+    }
+
+    /**
+     * HyperOS 4 keeps "允许通知" switched off (and reverts manual enabling to "不允许")
+     * when the app never asks for POST_NOTIFICATIONS. Ask once on launch so the user can
+     * grant it; the notification itself is posted from the Bluetooth host process.
+     */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 }

@@ -7,6 +7,14 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <!-- Required since API 33 to post the headset-control notification and the Focus Island.
+         HyperOS 4 automatically resets this permission to "不允许" for apps whose targetSdk >= 33
+         when it is missing from the manifest, which disabled both features. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <queries>
+        <package android:name="com.moondroplab.moondrop.moondrop_app" />
+    </queries>
 
     <application
         android:allowBackup="true"

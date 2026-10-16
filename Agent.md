@@ -2,8 +2,8 @@
 
 **Project**: Moondrop Pill / OBA HyperOS LSPosed module  
 **Package**: `com.karin.hyperpill`  
-**UI**: Jetpack Compose + Miuix `0.9.4-rc01`  
-**Last Updated**: 2026-08-18
+**UI**: Jetpack Compose + Miuix `0.9.4`  
+**Last Updated**: 2026-10-16
 
 ---
 
@@ -84,6 +84,26 @@ The app must not perform any network requests.
 - No community/EQ server requests
 - No remote image loading
 - Developer avatars are bundled as local drawables
+
+---
+
+## Notification Permission (HyperOS 4)
+
+Two features depend on posting notifications: the notification-center headset control
+(`HyperPillNotificationUtil.showPodsNotification`) and the Focus Island battery display
+(`FocusIslandUtil.showBatteryIsland`).
+
+`POST_NOTIFICATIONS` **must stay declared in `app/src/main/AndroidManifest.xml`**. Without it,
+HyperOS 4 (unlike HyperOS 3) treats the app as "never asked", so 设置 → 通知管理 shows every
+sub-toggle greyed out with "此应用未发布任何通知", and manually enabling 允许通知 reverts to
+不允许. Both features then silently do nothing.
+
+`MainActivity.requestNotificationPermissionIfNeeded()` requests the permission on launch.
+
+Note the process boundary: both notifications are posted from inside the Bluetooth host
+package (`com.xiaomi.bluetooth` / `com.android.bluetooth`), so at runtime the permission that
+actually gates `nm.notify(...)` is the **host's**, not the module's. Both call sites check
+`context.checkSelfPermission(POST_NOTIFICATIONS)` and log a warning instead of failing silently.
 
 ---
 
