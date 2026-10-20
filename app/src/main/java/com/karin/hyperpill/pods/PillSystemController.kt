@@ -15,6 +15,8 @@ object HyperPILLAction {
     const val ACTION_PODS_CONNECTED = "com.karin.hyperpill.action.pods_connected"
     const val ACTION_PODS_DISCONNECTED = "com.karin.hyperpill.action.pods_disconnected"
     const val ACTION_PODS_BATTERY_CHANGED = "com.karin.hyperpill.action.pods_battery_changed"
+    const val ACTION_PODS_CONFIG_CHANGED = "com.karin.hyperpill.action.pods_config_changed"
+    const val ACTION_APPLY_CONFIG = "com.karin.hyperpill.action.apply_config"
     const val ACTION_REFRESH_STATUS = "com.karin.hyperpill.action.refresh_status"
 }
 
@@ -31,6 +33,19 @@ data class BatteryParams(
     val case: PodParams? = null,
     val single: PodParams? = null
 )
+
+/**
+ * Builds a pod reading from a raw protocol level byte.
+ *
+ * The headset reports a level byte of 0 while a pod is settling -- taking it out of the
+ * case, re-establishing its link, or right after the RFCOMM stream is rebuilt -- and then
+ * sends the real value one poll later. 0 is not a usable percentage for a pod that is
+ * reporting at all (a genuinely flat pod still reports a small nonzero byte), so surfacing
+ * it as "0%" told the user an earbud was empty when it was not. Returning null makes the
+ * pod read as "no reading yet" and leaves null handling to each consumer.
+ */
+private fun podReading(level: Int?): PodParams? =
+    level?.takeIf { it > 0 }?.let { PodParams(it, false, true) }
 
 /**
  * Runs inside the Android Bluetooth process.
@@ -59,12 +74,38 @@ object PillSystemController {
         "com.karin.hyperpill"
     )
 
+    /**
+     * Packages that can host a live controller session.
+     *
+     * The activity runs in com.karin.hyperpill, but the UI process never owns a session:
+     * PillViewModel.connect() opens a plain PillClient, and the only caller of
+     * PillSystemController.connect() is HeadsetStateDispatcher, which HookEntry loads for
+     * com.android.bluetooth only. Addressing outgoing control broadcasts to the module's own
+     * package therefore reached a controller that had no socket and silently dropped every
+     * write, which is why the device page stayed read-only while the system auto-connected
+     * and only worked after a manual disconnect + tap-connect (that tap creates a local
+     * client, so the client-first setters short-circuit before this path is used).
+     */
+    val CONTROL_TARGET_PACKAGES = listOf(
+        "com.android.bluetooth",
+        "com.xiaomi.bluetooth"
+    )
+
     private val connected = AtomicBoolean(false)
     private var context: Context? = null
     private var device: BluetoothDevice? = null
     private var client: PillClient? = null
     private var pollThread: Thread? = null
     private var currentBattery: BatteryParams? = null
+
+    /**
+     * Last voice configuration read from the headset.
+     *
+     * The UI sends a partial update (it may change only the toggle or only the level), and
+     * the GAIA setter needs all three fields at once, so the missing ones are filled from
+     * the most recent read rather than being guessed as zero.
+     */
+    private var currentVoiceConf: VoiceConf? = null
     private var receiverRegistered = false
 
     private val handler = Handler(Looper.getMainLooper())
@@ -81,6 +122,19 @@ object PillSystemController {
     fun isConnectedTo(address: String?): Boolean =
         address != null && connected.get() && device?.address == address
 
+    /**
+     * The device this process currently holds a session with, or null.
+     *
+     * The UI cannot rely on its own paired-device list to name a live session: it is only
+     * populated once the user taps refresh, and auto-connect happens entirely inside the
+     * hooked bluetooth process. Exposing the controller's own device lets the screen
+     * describe a session it never initiated.
+     */
+    fun connectedDevice(): BluetoothDevice? = if (connected.get()) device else null
+
+    /** Address of the live session, or null. Lets a caller resolve the device itself. */
+    fun connectedAddress(): String? = if (connected.get()) device?.address else null
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
@@ -96,6 +150,11 @@ object PillSystemController {
                         sendConnectedBroadcast(d)
                     }
                     queryBattery()
+                }
+
+                HyperPILLAction.ACTION_APPLY_CONFIG -> {
+                    Log.diag("[Controller] apply config from UI")
+                    applyConfig(intent)
                 }
             }
         }
@@ -127,8 +186,25 @@ object PillSystemController {
             try {
                 val c = PillClient(target, object : PillClient.Listener {
                     override fun onConnected() {
-                        Log.diag("[Controller] RFCOMM connected ${target.address}, querying battery")
+                        Log.diag("[Controller] RFCOMM connected ${target.address}, querying battery + config")
                         queryBattery()
+                        queryConfig()
+                        // The first battery frame after RFCOMM comes up is routinely a
+                        // transient: repeated captures show 01 64 02 64 (100/100) once the
+                        // link has settled, but the frame issued immediately after connect
+                        // is 01 5A 02 00 -> L=90, R=0 even when both pods are full. Without
+                        // a retry that transient stayed on screen until the 30s poll, which
+                        // read as "battery is wrong on first connect". Re-ask a few times
+                        // over the next seconds so the real values land almost immediately.
+                        val settleAddress = target.address
+                        listOf(400L, 1_200L, 3_000L).forEach { delayMs ->
+                            handler.postDelayed({
+                                if (connected.get() && device?.address == settleAddress) {
+                                    Log.d(TAG, "battery re-query after connect (+${delayMs}ms)")
+                                    queryBattery()
+                                }
+                            }, delayMs)
+                        }
                     }
 
                     override fun onFrame(pdu: ByteArray) {
@@ -227,7 +303,9 @@ object PillSystemController {
         if (receiverRegistered) return
         ctx.registerReceiver(
             receiver,
-            IntentFilter(HyperPILLAction.ACTION_REFRESH_STATUS),
+            IntentFilter(HyperPILLAction.ACTION_REFRESH_STATUS).apply {
+                addAction(HyperPILLAction.ACTION_APPLY_CONFIG)
+            },
             Context.RECEIVER_EXPORTED
         )
         receiverRegistered = true
@@ -266,24 +344,165 @@ object PillSystemController {
         }
     }
 
+    /**
+     * Asks the headset for its stored configuration and relays the answers to the UI.
+     *
+     * These queries used to be issued only by the app's own PillClient when the app owned
+     * the socket. In the normal path the system side owns it, so nothing ever asked, the
+     * UI's gain/EQ/voice/dual-connection fields stayed null, and every control on the device
+     * page was disabled. Asking here and broadcasting the values lets the configuring screen
+     * show real state and drive the live session.
+     */
+    private fun queryConfig() {
+        val c = client ?: return
+        if (!connected.get()) return
+        runCatching {
+            c.requestGain()
+            c.requestEqState()
+            c.requestAvailablePreSets()
+            c.requestEqSet()
+            c.requestOneBringTwoState()
+            c.requestOneBringTwoTimeout()
+            c.requestVoiceConf()
+            Log.d(TAG, "config queries sent")
+        }.onFailure { t ->
+            if (!connected.get()) return@onFailure
+            Log.w(TAG, "config query failed: ${t.message}")
+        }
+    }
+
+    /**
+     * Applies a settings change that the UI asked for.
+     *
+     * The device page used to write through its own PillClient, which never exists in the
+     * normal path because the system side owns the socket -- so every control refused unless
+     * the user disconnected and connected by hand. Forwarding the write here lets the screen
+     * drive the session that is actually live. Every setter is followed by a fresh read so
+     * the UI's optimistic value is corrected by the device.
+     */
+    private fun applyConfig(intent: Intent) {
+        val c = client
+        if (c == null || !connected.get()) {
+            Log.diag("[Controller] apply config ignored: no live session")
+            return
+        }
+        runCatching {
+            when {
+                intent.hasExtra("gain_index") ->
+                    c.setGain(intent.getIntExtra("gain_index", 0))
+
+                intent.hasExtra("eq_selected") ->
+                    c.setEqSet(intent.getIntExtra("eq_selected", 0))
+
+                intent.hasExtra("one_bring_two_enabled") ->
+                    c.setOneBringTwoState(intent.getBooleanExtra("one_bring_two_enabled", false))
+
+                intent.hasExtra("one_bring_two_timeout") ->
+                    c.setOneBringTwoTimeout(intent.getIntExtra("one_bring_two_timeout", 0))
+
+                intent.hasExtra("voice_enabled") || intent.hasExtra("voice_volume") -> {
+                    val current = currentVoiceConf
+                    val enabled = intent.getBooleanExtra("voice_enabled", current?.enabled ?: false)
+                    val volume = intent.getIntExtra("voice_volume", current?.volume ?: 0)
+                    val index = intent.getIntExtra("voice_index", current?.index ?: 0)
+                    c.setVoiceConf(enabled, volume, index)
+                }
+
+                else -> {
+                    Log.diag("[Controller] apply config: no recognised extra")
+                    return@runCatching
+                }
+            }
+            Log.diag("[Controller] apply config sent, re-reading")
+            queryConfig()
+        }.onFailure { t ->
+            Log.diag("[Controller] apply config FAILED: ${t.message}", t)
+        }
+    }
+
     private fun handleFrame(pdu: ByteArray) {
         val command = GaiaProtocol.commandValueOf(pdu)
         val type = (command shr 7) and 0x03
         val feature = (command shr 9) and 0x7F
         val cmd = command and 0x7F
         if (type != GaiaProtocol.TYPE_RESPONSE) return
-        if (feature != GaiaProtocol.FEATURE_BATTERY || cmd != GaiaProtocol.CMD_GET_BATTERY_LEVELS) return
 
-        val levels = GaiaProtocol.parseBatteryLevels(GaiaProtocol.payloadOf(pdu))
-        val battery = BatteryParams(
-            left = levels[GaiaProtocol.BATTERY_LEFT]?.let { PodParams(it, false, true) },
-            right = levels[GaiaProtocol.BATTERY_RIGHT]?.let { PodParams(it, false, true) },
-            case = levels[GaiaProtocol.BATTERY_CHARGER_CASE]?.let { PodParams(it, false, true) },
-            single = levels[GaiaProtocol.BATTERY_SINGLE_DEVICE]?.let { PodParams(it, false, true) }
-        )
-        currentBattery = battery
-        Log.i(TAG, "battery ${battery.single?.battery ?: "--"} single, L=${battery.left?.battery ?: "--"} R=${battery.right?.battery ?: "--"} C=${battery.case?.battery ?: "--"}")
-        sendBatteryBroadcast(battery)
+        if (feature == GaiaProtocol.FEATURE_BATTERY && cmd == GaiaProtocol.CMD_GET_BATTERY_LEVELS) {
+            val levels = GaiaProtocol.parseBatteryLevels(GaiaProtocol.payloadOf(pdu))
+            val battery = BatteryParams(
+                left = podReading(levels[GaiaProtocol.BATTERY_LEFT]),
+                right = podReading(levels[GaiaProtocol.BATTERY_RIGHT]),
+                case = podReading(levels[GaiaProtocol.BATTERY_CHARGER_CASE]),
+                single = podReading(levels[GaiaProtocol.BATTERY_SINGLE_DEVICE])
+            )
+            currentBattery = battery
+            Log.diag("[Controller] battery L=${battery.left?.battery ?: "--"} R=${battery.right?.battery ?: "--"} C=${battery.case?.battery ?: "--"} single=${battery.single?.battery ?: "--"}")
+            sendBatteryBroadcast(battery)
+            return
+        }
+
+        handleConfigFrame(feature, cmd, GaiaProtocol.payloadOf(pdu))
+    }
+
+    /**
+     * Relays a configuration answer to whoever is showing the device page.
+     *
+     * Only the values that have a parser are forwarded; anything else is ignored so an
+     * unrecognised or newer command cannot corrupt the UI's cached state.
+     */
+    private fun handleConfigFrame(feature: Int, cmd: Int, payload: ByteArray) {
+        val values = android.os.Bundle()
+        var recognised = true
+        when {
+            feature == GaiaProtocol.FEATURE_DAC_GAIN && cmd == GaiaProtocol.CMD_GET_GAIN ->
+                values.putInt("gain_index", GaiaProtocol.parseGainIndex(payload))
+
+            feature == GaiaProtocol.FEATURE_MUSIC_PROCESSING && cmd == GaiaProtocol.CMD_GET_EQ_STATE ->
+                values.putInt("eq_state", GaiaProtocol.parseEqState(payload))
+
+            feature == GaiaProtocol.FEATURE_MUSIC_PROCESSING && cmd == GaiaProtocol.CMD_GET_AVAILABLE_EQ_PRE_SETS -> {
+                val presets = GaiaProtocol.parseAvailablePreSets(payload)
+                values.putIntArray("eq_presets", presets.toIntArray())
+            }
+
+            feature == GaiaProtocol.FEATURE_MUSIC_PROCESSING && cmd == GaiaProtocol.CMD_GET_EQ_SET ->
+                values.putInt("eq_selected", GaiaProtocol.parseEqSet(payload))
+
+            feature == GaiaProtocol.FEATURE_ONEBRINGTWO && cmd == GaiaProtocol.CMD_GET_ONEBRINGTWO_STATE ->
+                values.putBoolean("one_bring_two_enabled", GaiaProtocol.parseOneBringTwoState(payload))
+
+            feature == GaiaProtocol.FEATURE_ONEBRINGTWO && cmd == GaiaProtocol.CMD_GET_ONEBRINGTWO_TIMEOUT ->
+                values.putInt("one_bring_two_timeout", GaiaProtocol.parseOneBringTwoTimeout(payload))
+
+            feature == GaiaProtocol.FEATURE_VOICE && cmd == GaiaProtocol.CMD_GET_VOICE_CONF ->
+                GaiaProtocol.parseVoiceConf(payload)?.let {
+                    currentVoiceConf = it
+                    values.putBoolean("voice_enabled", it.enabled)
+                    values.putInt("voice_volume", it.volume)
+                    values.putInt("voice_index", it.index)
+                } ?: run { recognised = false }
+
+            else -> recognised = false
+        }
+        if (!recognised) {
+            Log.d(TAG, "unhandled config response feature=$feature cmd=$cmd")
+            return
+        }
+        Log.diag("[Config] feature=$feature cmd=$cmd -> ${values.keySet().joinToString()}")
+        sendConfigBroadcast(values)
+    }
+
+    private fun sendConfigBroadcast(values: android.os.Bundle) {
+        val ctx = context ?: return
+        val base = Intent(HyperPILLAction.ACTION_PODS_CONFIG_CHANGED).apply {
+            putExtras(values)
+            device?.address?.let { putExtra("address", it) }
+            addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+        }
+        ctx.sendBroadcast(Intent(base).setPackage(ctx.packageName))
+        BROADCAST_TARGETS.forEach { pkg ->
+            ctx.sendBroadcast(Intent(base).setPackage(pkg))
+        }
     }
 
     private fun sendConnectedBroadcast(device: BluetoothDevice) {

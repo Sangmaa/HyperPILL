@@ -25,6 +25,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
@@ -36,6 +37,7 @@ import com.karin.hyperpill.R
 import top.yukonga.miuix.kmp.basic.BasicComponent
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.Card
+import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 
 private data class Developer(
@@ -87,6 +89,9 @@ fun AboutPage(
     var versionTapCount by remember { mutableIntStateOf(0) }
     var lastVersionTap by remember { mutableLongStateOf(0L) }
     var showDebugButton by remember { mutableStateOf(false) }
+    // Read once from PackageManager: the flag is persisted by the system, so the switch
+    // reflects what the launcher will actually show after a restart.
+    var launcherVisible by remember { mutableStateOf(LauncherIconController.isVisible(context)) }
 
     fun onVersionClick() {
         val now = System.currentTimeMillis()
@@ -153,6 +158,34 @@ fun AboutPage(
                                 )
                             },
                             onClick = { openUrl(context, developer.url) }
+                        )
+                    }
+                }
+            }
+        }
+
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("外观", fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("显示桌面图标")
+                            Text(
+                                "关闭后可从 LSPosed 的模块页面再次进入本页打开",
+                                fontSize = 12.sp
+                            )
+                        }
+                        Switch(
+                            checked = launcherVisible,
+                            onCheckedChange = { next ->
+                                launcherVisible = next
+                                LauncherIconController.setVisible(context, next)
+                            }
                         )
                     }
                 }

@@ -70,7 +70,13 @@ fun DeviceConfigPage(
     onSetVoiceEnabled: (Boolean) -> Unit,
     onSetVoiceVolume: (Int) -> Unit
 ) {
-    val deviceName = state.spoofedDeviceName ?: state.selectedDevice?.name
+    // Same fallback as HomePage: when the system side owns the session there is no local
+    // BluetoothDevice, so the name announced over the broadcasts is what identifies the
+    // product (and therefore which artwork to show).
+    val deviceName = state.spoofedDeviceName
+        ?: state.selectedDevice?.name
+        ?: state.connectedDeviceName
+        ?: state.connectedAddress
     val product = PillProducts.fromDeviceName(deviceName)
     val showBandLogo = product?.uuid in bocchiTheRockUuids
 

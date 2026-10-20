@@ -30,13 +30,28 @@
             android:exported="true"
             android:label="@string/app_name"
             android:theme="@style/Theme.HyperPILL"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize" />
+
+        <!--
+            The launcher entry sits on an alias instead of on .MainActivity so the icon can
+            be hidden at runtime (About page switch -> LauncherIconController). Only this
+            alias is disabled; MainActivity stays exported and launchable from LSPosed, adb
+            and the notification, which disabling the activity's own component would break.
+        -->
+        <activity-alias
+            android:name=".LauncherAlias"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name"
+            android:roundIcon="@mipmap/ic_launcher_round"
+            android:targetActivity=".MainActivity">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
     </application>
 
 </manifest>

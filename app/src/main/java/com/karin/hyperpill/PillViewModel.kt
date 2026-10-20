@@ -19,6 +19,16 @@ import kotlinx.coroutines.launch
 data class PillUiState(
     val devices: List<BluetoothDevice> = emptyList(),
     val selectedDevice: BluetoothDevice? = null,
+    /**
+     * Live session facts learned from the controller's broadcasts.
+     *
+     * The controller runs inside the hooked bluetooth host, so this process's own
+     * PillSystemController instance never has a session of its own and cannot answer
+     * "which device is connected". The broadcasts carry the address and name; keeping
+     * them here lets the UI show a real device on a cold start instead of "--".
+     */
+    val connectedAddress: String? = null,
+    val connectedDeviceName: String? = null,
     val connected: Boolean = false,
     val batteryLevels: Map<Int, Int> = emptyMap(),
     val supportedBatteries: List<Int> = emptyList(),
@@ -59,8 +69,16 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
             override fun onReceive(context: android.content.Context?, intent: android.content.Intent?) {
                 when (intent?.action) {
                     com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_BATTERY_CHANGED -> {
-                        adoptSystemSessionIfAny()
+                        // Fill connectedAddress/name from the broadcast FIRST, so that
+                        // adoptSystemSessionIfAny can resolve the device even on a cold start
+                        // where the paired-device list is empty. Previously the adopt ran
+                        // before the address was recorded, so a live session showed as
+                        // "not connected" until the user tapped connect by hand.
                         applyBroadcastBattery(intent)
+                        adoptSystemSessionIfAny()
+                    }
+                    com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_CONFIG_CHANGED -> {
+                        applyBroadcastConfig(intent)
                     }
                     com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_DISCONNECTED -> {
                         com.karin.hyperpill.hook.Log.diag("[ViewModel] mirror saw disconnect, clearing UI")
@@ -69,12 +87,23 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
                             it.copy(
                                 connected = false,
                                 selectedDevice = null,
+                                connectedAddress = null,
+                                connectedDeviceName = null,
                                 batteryLevels = emptyMap(),
                                 message = "已断开"
                             )
                         }
                     }
                     com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_CONNECTED -> {
+                        com.karin.hyperpill.hook.Log.diag("[ViewModel] mirror saw connect for ${intent.getStringExtra("address")}")
+                        _uiState.update {
+                            it.copy(
+                                connected = true,
+                                connectedAddress = intent.getStringExtra("address") ?: it.connectedAddress,
+                                connectedDeviceName = intent.getStringExtra("device_name") ?: it.connectedDeviceName,
+                                selectedDevice = it.selectedDevice ?: resolveConnectedDevice()
+                            )
+                        }
                         adoptSystemSessionIfAny()
                     }
                 }
@@ -84,6 +113,7 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
             receiver,
             android.content.IntentFilter().apply {
                 addAction(com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_BATTERY_CHANGED)
+                addAction(com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_CONFIG_CHANGED)
                 addAction(com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_CONNECTED)
                 addAction(com.karin.hyperpill.pods.HyperPILLAction.ACTION_PODS_DISCONNECTED)
             },
@@ -98,6 +128,27 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
         )
         mirrorReceiver = receiver
         adoptSystemSessionIfAny()
+        // Ask the controller to re-announce its session right now instead of waiting up to
+        // BATTERY_POLL_INTERVAL_MS (30s) for the next poll. On a cold launcher the UI would
+        // otherwise sit on "not connected" for up to 30s even though the pods are already up,
+        // which read as a manual-tap-required bug. The controller re-emits connected +
+        // battery + config on this signal.
+        requestRefresh()
+    }
+
+    /** Tells the system-side controller to re-announce the current session immediately. */
+    private fun requestRefresh() {
+        val ctx = getApplication<Application>().applicationContext
+        runCatching {
+            com.karin.hyperpill.pods.PillSystemController.CONTROL_TARGET_PACKAGES.forEach { pkg ->
+                ctx.sendBroadcast(
+                    android.content.Intent(
+                        com.karin.hyperpill.pods.HyperPILLAction.ACTION_REFRESH_STATUS
+                    ).setPackage(pkg)
+                )
+            }
+            com.karin.hyperpill.hook.Log.diag("[ViewModel] requested immediate session refresh")
+        }
     }
 
     fun stopMirroringSystemSession() {
@@ -125,7 +176,66 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
             record("single_battery", "single_connected", GaiaProtocol.BATTERY_SINGLE_DEVICE)
         }
         if (levels.isEmpty()) return
-        _uiState.update { it.copy(batteryLevels = levels, connected = true, busy = false) }
+        _uiState.update {
+            it.copy(
+                batteryLevels = levels,
+                connected = true,
+                busy = false,
+                connectedAddress = intent.getStringExtra("address") ?: it.connectedAddress,
+                connectedDeviceName = intent.getStringExtra("device_name") ?: it.connectedDeviceName
+            )
+        }
+    }
+
+    /**
+     * Folds a configuration broadcast from the system-side controller into UI state.
+     *
+     * The device page's controls read these fields, and they used to be filled only by this
+     * process's own PillClient -- which never connects when the system side owns the socket.
+     * Every control therefore showed "--" and refused to act. The controller now asks the
+     * headset directly and forwards the answers here.
+     */
+    private fun applyBroadcastConfig(intent: android.content.Intent) {
+        val voice = if (intent.hasExtra("voice_enabled")) {
+            VoiceConf(
+                enabled = intent.getBooleanExtra("voice_enabled", false),
+                volume = intent.getIntExtra("voice_volume", 0),
+                index = intent.getIntExtra("voice_index", 0)
+            )
+        } else {
+            null
+        }
+        _uiState.update { state ->
+            state.copy(
+                gainIndex = if (intent.hasExtra("gain_index")) {
+                    intent.getIntExtra("gain_index", 0)
+                } else {
+                    state.gainIndex
+                },
+                eqState = if (intent.hasExtra("eq_state")) {
+                    intent.getIntExtra("eq_state", 0)
+                } else {
+                    state.eqState
+                },
+                eqPresets = intent.getIntArrayExtra("eq_presets")?.toList() ?: state.eqPresets,
+                eqSelected = if (intent.hasExtra("eq_selected")) {
+                    intent.getIntExtra("eq_selected", 0)
+                } else {
+                    state.eqSelected
+                },
+                oneBringTwoEnabled = if (intent.hasExtra("one_bring_two_enabled")) {
+                    intent.getBooleanExtra("one_bring_two_enabled", false)
+                } else {
+                    state.oneBringTwoEnabled
+                },
+                oneBringTwoTimeout = if (intent.hasExtra("one_bring_two_timeout")) {
+                    intent.getIntExtra("one_bring_two_timeout", 0)
+                } else {
+                    state.oneBringTwoTimeout
+                },
+                voiceConf = voice ?: state.voiceConf
+            )
+        }
     }
 
     override fun onCleared() {
@@ -162,18 +272,45 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
      * here keeps the screen honest and removes the pointless tap.
      */
     private fun adoptSystemSessionIfAny(pills: List<BluetoothDevice> = _uiState.value.devices) {
+        // Prefer a device from the caller's list, but fall back to whatever the controller
+        // has announced over its broadcasts. On a cold launcher the list is empty until the
+        // user taps refresh, so keying only off it meant a live session showed as
+        // "not connected" and required a manual tap even though the focus island had fired.
         val live = pills.firstOrNull {
             com.karin.hyperpill.pods.PillSystemController.isConnectedTo(it.address)
-        } ?: return
-        com.karin.hyperpill.hook.Log.diag("[ViewModel] adopting live system session for ${live.address}")
+        } ?: resolveConnectedDevice()
+        ?: return
+        val name = live.name ?: _uiState.value.connectedDeviceName ?: live.address
+        com.karin.hyperpill.hook.Log.diag("[ViewModel] adopting live system session for ${live.address} name=${live.name}")
         _uiState.update {
             it.copy(
                 selectedDevice = live,
                 connected = true,
                 busy = false,
-                message = "已连接 ${live.name}"
+                connectedAddress = live.address,
+                connectedDeviceName = _uiState.value.connectedDeviceName ?: live.name,
+                message = "已连接 ${name}"
             )
         }
+    }
+
+    /**
+     * Resolves the connected BluetoothDevice without relying on the paired-device list.
+     *
+     * The controller is an in-process singleton, so in this process it is always empty --
+     * the real session lives in the hooked bluetooth host. The address learned from that
+     * host's broadcasts is the only authoritative source here; resolve it via the adapter so
+     * BluetoothDevice.name still works.
+     */
+    @Suppress("MissingPermission")
+    private fun resolveConnectedDevice(): BluetoothDevice? {
+        com.karin.hyperpill.pods.PillSystemController.connectedDevice()?.let { return it }
+        val address = com.karin.hyperpill.pods.PillSystemController.connectedAddress()
+            ?: _uiState.value.connectedAddress
+            ?: return null
+        return runCatching {
+            BluetoothAdapter.getDefaultAdapter()?.bondedDevices?.firstOrNull { it.address == address }
+        }.getOrNull()
     }
 
     /** Re-syncs UI state with the system controller whenever the screen is shown. */
@@ -300,6 +437,32 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
         return c
     }
 
+    /**
+     * Sends a configuration write over whichever channel currently owns the headset.
+     *
+     * In the normal path the system-side controller holds the RFCOMM socket and this process
+     * has no client at all, so routing every write through [requireLocalClient] made the whole
+     * device page read-only even while the pods were connected. The write is forwarded to the
+     * controller over a broadcast instead of opening a second socket, which cannot coexist
+     * with the live one.
+     */
+    private fun writeConfig(action: String, vararg extras: Pair<String, Any?>) {
+        client?.let { return }
+        val ctx = getApplication<Application>().applicationContext
+        val base = android.content.Intent(com.karin.hyperpill.pods.HyperPILLAction.ACTION_APPLY_CONFIG)
+        extras.forEach { (key, value) ->
+            when (value) {
+                is Boolean -> base.putExtra(key, value)
+                is Int -> base.putExtra(key, value)
+                is String -> base.putExtra(key, value)
+            }
+        }
+        com.karin.hyperpill.pods.PillSystemController.CONTROL_TARGET_PACKAGES.forEach { pkg ->
+            ctx.sendBroadcast(android.content.Intent(base).setPackage(pkg))
+        }
+        com.karin.hyperpill.hook.Log.diag("[ViewModel] forwarded config write action=$action via controller")
+    }
+
     fun refreshBattery() {
         val c = requireLocalClient() ?: return
         viewModelScope.launch(Dispatchers.IO) {
@@ -309,76 +472,110 @@ class PillViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun setGain(index: Int) {
-        val c = requireLocalClient() ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { c.setGain(index) }
-                .onSuccess { _uiState.update { it.copy(gainIndex = index, message = "增益已设为 $index") } }
-                .onFailure { _uiState.update { it.copy(message = "设置增益失败: ${it.message}") } }
+        client?.let { c ->
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { c.setGain(index) }
+                    .onSuccess { _uiState.update { it.copy(gainIndex = index, message = "增益已设为 $index") } }
+                    .onFailure { _uiState.update { it.copy(message = "设置增益失败: ${it.message}") } }
+            }
+            return
         }
+        writeConfig("set_gain", "gain_index" to index)
+        _uiState.update { it.copy(gainIndex = index) }
     }
 
     fun selectEqSet(presetId: Int) {
-        val c = requireLocalClient() ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { c.setEqSet(presetId) }
-                .onSuccess { _uiState.update { it.copy(eqSelected = presetId, message = "EQ 已切换为 $presetId") } }
-                .onFailure { _uiState.update { it.copy(message = "切换 EQ 失败: ${it.message}") } }
+        client?.let { c ->
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { c.setEqSet(presetId) }
+                    .onSuccess { _uiState.update { it.copy(eqSelected = presetId, message = "EQ 已切换为 $presetId") } }
+                    .onFailure { _uiState.update { it.copy(message = "切换 EQ 失败: ${it.message}") } }
+            }
+            return
         }
+        writeConfig("set_eq", "eq_selected" to presetId)
+        _uiState.update { it.copy(eqSelected = presetId) }
     }
 
     fun setOneBringTwoState(enabled: Boolean) {
-        val c = requireLocalClient() ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { c.setOneBringTwoState(enabled) }
-                .onSuccess { _uiState.update { it.copy(oneBringTwoEnabled = enabled, message = if (enabled) "双设备连接已开启" else "双设备连接已关闭") } }
-                .onFailure { _uiState.update { it.copy(message = "设置双设备连接失败: ${it.message}") } }
+        client?.let { c ->
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { c.setOneBringTwoState(enabled) }
+                    .onSuccess { _uiState.update { it.copy(oneBringTwoEnabled = enabled, message = if (enabled) "双设备连接已开启" else "双设备连接已关闭") } }
+                    .onFailure { _uiState.update { it.copy(message = "设置双设备连接失败: ${it.message}") } }
+            }
+            return
         }
+        writeConfig("one_bring_two_state", "one_bring_two_enabled" to enabled)
+        _uiState.update { it.copy(oneBringTwoEnabled = enabled) }
     }
 
     fun setOneBringTwoTimeout(timeout: Int) {
-        val c = requireLocalClient() ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { c.setOneBringTwoTimeout(timeout) }
-                .onSuccess { _uiState.update { it.copy(oneBringTwoTimeout = timeout, message = "双设备超时已设为 $timeout") } }
-                .onFailure { _uiState.update { it.copy(message = "设置双设备超时失败: ${it.message}") } }
+        client?.let { c ->
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { c.setOneBringTwoTimeout(timeout) }
+                    .onSuccess { _uiState.update { it.copy(oneBringTwoTimeout = timeout, message = "双设备超时已设为 $timeout") } }
+                    .onFailure { _uiState.update { it.copy(message = "设置双设备超时失败: ${it.message}") } }
+            }
+            return
         }
+        writeConfig("one_bring_two_timeout", "one_bring_two_timeout" to timeout)
+        _uiState.update { it.copy(oneBringTwoTimeout = timeout) }
     }
 
     fun setVoiceEnabled(enabled: Boolean) {
-        val c = requireLocalClient() ?: return
         val current = _uiState.value.voiceConf
         val volume = current?.volume ?: 100
         val index = current?.index ?: 0
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { c.setVoiceConf(enabled, volume, index) }
-                .onSuccess {
-                    _uiState.update {
-                        it.copy(
-                            voiceConf = VoiceConf(enabled = enabled, volume = volume, index = index),
-                            message = if (enabled) "提示音已开启" else "提示音已关闭"
-                        )
+        client?.let { c ->
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { c.setVoiceConf(enabled, volume, index) }
+                    .onSuccess {
+                        _uiState.update {
+                            it.copy(
+                                voiceConf = VoiceConf(enabled = enabled, volume = volume, index = index),
+                                message = if (enabled) "提示音已开启" else "提示音已关闭"
+                            )
+                        }
                     }
-                }
-                .onFailure { _uiState.update { it.copy(message = "设置提示音开关失败: ${it.message}") } }
+                    .onFailure { _uiState.update { it.copy(message = "设置提示音开关失败: ${it.message}") } }
+            }
+            return
+        }
+        writeConfig("set_voice_conf", "voice_enabled" to enabled, "voice_volume" to volume, "voice_index" to index)
+        _uiState.update {
+            it.copy(
+                voiceConf = VoiceConf(enabled = enabled, volume = volume, index = index),
+                message = if (enabled) "提示音已开启" else "提示音已关闭"
+            )
         }
     }
 
     fun setVoiceVolume(volume: Int) {
-        val c = requireLocalClient() ?: return
         val current = _uiState.value.voiceConf
         val enabled = current?.enabled ?: true
         val index = current?.index ?: 0
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { c.setVoiceConf(enabled, volume, index) }
-                .onSuccess {
-                    _uiState.update {
-                        it.copy(
-                            voiceConf = VoiceConf(enabled = enabled, volume = volume, index = index),
-                            message = "提示音音量已设为 $volume%"
-                        )
+        client?.let { c ->
+            viewModelScope.launch(Dispatchers.IO) {
+                runCatching { c.setVoiceConf(enabled, volume, index) }
+                    .onSuccess {
+                        _uiState.update {
+                            it.copy(
+                                voiceConf = VoiceConf(enabled = enabled, volume = volume, index = index),
+                                message = "提示音音量已设为 $volume%"
+                            )
+                        }
                     }
-                }
-                .onFailure { _uiState.update { it.copy(message = "设置提示音音量失败: ${it.message}") } }
+                    .onFailure { _uiState.update { it.copy(message = "设置提示音音量失败: ${it.message}") } }
+            }
+            return
+        }
+        writeConfig("set_voice_conf", "voice_enabled" to enabled, "voice_volume" to volume, "voice_index" to index)
+        _uiState.update {
+            it.copy(
+                voiceConf = VoiceConf(enabled = enabled, volume = volume, index = index),
+                message = "提示音音量已设为 $volume%"
+            )
         }
     }
 

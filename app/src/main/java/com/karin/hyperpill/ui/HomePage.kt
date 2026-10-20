@@ -88,7 +88,13 @@ fun HomePage(
     onOpenConfig: () -> Unit
 ) {
     val connected = state.connected || state.spoofedDeviceName != null
-    val deviceName = state.spoofedDeviceName ?: state.selectedDevice?.name
+    // The system-side controller owns the socket in the normal auto-connect path, and this
+    // process never holds that BluetoothDevice. Its broadcasts carry the name, so fall back
+    // to the announced name (then the address) instead of rendering "--".
+    val deviceName = state.spoofedDeviceName
+        ?: state.selectedDevice?.name
+        ?: state.connectedDeviceName
+        ?: state.connectedAddress
     val status = connectionStatus(state, connected)
     val retry = {
         if (connected) onRefreshBattery()
