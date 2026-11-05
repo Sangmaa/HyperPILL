@@ -68,6 +68,21 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // The UI only ships Chinese and English, so every other locale that Compose and Miuix
+    // package is dead weight in resources.arsc and in res/values-*.
+    androidResources {
+        localeFilters += listOf("zh", "en")
+    }
+
+    // AGP leaves classes.dex stored (uncompressed) for minSdk >= 28 because ART can map it
+    // in place. That trades download size for a slightly slower cold start, which is the
+    // wrong trade for a GitHub release APK: compressed is ~55% smaller in the artifact.
+    packaging {
+        dex {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 kotlin {
@@ -79,10 +94,8 @@ kotlin {
 dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
-    implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
-    implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
 
