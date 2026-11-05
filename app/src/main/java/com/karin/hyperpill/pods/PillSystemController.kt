@@ -59,6 +59,19 @@ object PillSystemController {
     private const val BATTERY_POLL_INTERVAL_MS = 30_000L
 
     /**
+     * How long after a connect the battery readings are held back before the first publish.
+     *
+     * The answer the headset gives immediately after RFCOMM comes up is a stale snapshot of
+     * the previous session: measured 01 5A 02 00 -> L=90, R=0 while both pods were full,
+     * turning into 01 64 02 64 about a second later. The system UI renders whatever it is
+     * handed first, so the focus island and the headset notification popped up showing the
+     * wrong pair of percentages and corrected themselves afterwards. Holding the readings
+     * for this window and publishing only the newest one turns that flicker into a single
+     * correct post.
+     */
+    private const val BATTERY_SETTLE_MS = 1_400L
+
+    /**
      * Packages the pod-state broadcasts are addressed to.
      *
      * The module runs in several processes at once, and a broadcast sent with
@@ -107,6 +120,12 @@ object PillSystemController {
      */
     private var currentVoiceConf: VoiceConf? = null
     private var receiverRegistered = false
+
+    /** Uptime deadline before which battery readings are held back; 0 means publish at once. */
+    private var settleUntilMs = 0L
+
+    /** Newest reading captured during the settle window, published when the window closes. */
+    private var pendingBattery: BatteryParams? = null
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -174,6 +193,15 @@ object PillSystemController {
         connected.set(true)
         registerReceiverIfNeeded()
 
+        // Hold the first battery readings: the frame the headset answers right after RFCOMM
+        // comes up is a stale snapshot of the previous session (L=90, R=0 while both pods
+        // were full). Publishing it made the focus island and the notification open with the
+        // wrong percentages and visibly correct themselves a second later. Readings are now
+        // staged for BATTERY_SETTLE_MS and only the newest one is published.
+        pendingBattery = null
+        settleUntilMs = android.os.SystemClock.elapsedRealtime() + BATTERY_SETTLE_MS
+        handler.postDelayed({ flushPendingBattery() }, BATTERY_SETTLE_MS + 120L)
+
         sendConnectedBroadcast(device)
 
         val ctx = this.context
@@ -197,7 +225,7 @@ object PillSystemController {
                         // read as "battery is wrong on first connect". Re-ask a few times
                         // over the next seconds so the real values land almost immediately.
                         val settleAddress = target.address
-                        listOf(400L, 1_200L, 3_000L).forEach { delayMs ->
+                        listOf(400L, 900L, 1_300L).forEach { delayMs ->
                             handler.postDelayed({
                                 if (connected.get() && device?.address == settleAddress) {
                                     Log.d(TAG, "battery re-query after connect (+${delayMs}ms)")
@@ -275,6 +303,8 @@ object PillSystemController {
         runCatching { client?.close() }
         client = null
         currentBattery = null
+        pendingBattery = null
+        settleUntilMs = 0L
         if (receiverRegistered) {
             runCatching { oldContext?.unregisterReceiver(receiver) }
             receiverRegistered = false
@@ -435,9 +465,8 @@ object PillSystemController {
                 case = podReading(levels[GaiaProtocol.BATTERY_CHARGER_CASE]),
                 single = podReading(levels[GaiaProtocol.BATTERY_SINGLE_DEVICE])
             )
-            currentBattery = battery
             Log.diag("[Controller] battery L=${battery.left?.battery ?: "--"} R=${battery.right?.battery ?: "--"} C=${battery.case?.battery ?: "--"} single=${battery.single?.battery ?: "--"}")
-            sendBatteryBroadcast(battery)
+            stageBattery(battery)
             return
         }
 
@@ -518,6 +547,48 @@ object PillSystemController {
         BROADCAST_TARGETS.forEach { pkg ->
             ctx.sendBroadcast(Intent(intent).setPackage(pkg))
         }
+    }
+
+    /**
+     * Queues a reading, or publishes it immediately when no settle window is open.
+     *
+     * A reading captured inside the window is only remembered: every later frame replaces
+     * the previous one, so the value that eventually reaches the system UI is the freshest
+     * one obtained during settling rather than the stale first answer.
+     */
+    private fun stageBattery(battery: BatteryParams) {
+        val remaining = settleUntilMs - android.os.SystemClock.elapsedRealtime()
+        if (remaining > 0L) {
+            pendingBattery = battery
+            Log.d(
+                TAG,
+                "battery held ${remaining}ms before settle L=${battery.left?.battery ?: "--"} R=${battery.right?.battery ?: "--"}"
+            )
+            return
+        }
+        publishBattery(battery)
+    }
+
+    /** Publishes the freshest reading captured during the settle window, if any. */
+    private fun flushPendingBattery() {
+        val held = pendingBattery
+        pendingBattery = null
+        settleUntilMs = 0L
+        if (held == null) return
+        if (!connected.get()) {
+            Log.d(TAG, "settle window closed while disconnected, dropping held reading")
+            return
+        }
+        Log.d(
+            TAG,
+            "settle window closed, publishing L=${held.left?.battery ?: "--"} R=${held.right?.battery ?: "--"}"
+        )
+        publishBattery(held)
+    }
+
+    private fun publishBattery(battery: BatteryParams) {
+        currentBattery = battery
+        sendBatteryBroadcast(battery)
     }
 
     private fun sendBatteryBroadcast(battery: BatteryParams) {
