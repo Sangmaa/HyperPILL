@@ -74,8 +74,12 @@ object PillSystemController {
      * level roughly half the time, which is what made the flicker come back in daily use.
      * The deadline is now set above the observed worst case and the island simply appears a
      * little later with the correct numbers, instead of appearing at once with a wrong pair.
+     *
+     * Later captures narrowed the spread: the stale pair was replayed for 0.8s, 13ms and 0.9s
+     * before the real level arrived, so the worst case is just under a second. 2.8s keeps
+     * better than 1.5x headroom over that while cutting the island delay nearly in half.
      */
-    private const val BATTERY_SETTLE_MS = 5_000L
+    private const val BATTERY_SETTLE_MS = 2_800L
 
     /**
      * Packages the pod-state broadcasts are addressed to.
@@ -246,7 +250,7 @@ object PillSystemController {
                         // read as "battery is wrong on first connect". Re-ask a few times
                         // over the next seconds so the real values land almost immediately.
                         val settleAddress = target.address
-                        listOf(400L, 900L, 1_300L, 2_000L, 2_800L, 3_600L, 4_400L).forEach { delayMs ->
+                        listOf(300L, 600L, 900L, 1_200L, 1_500L, 1_900L, 2_300L, 2_600L).forEach { delayMs ->
                             handler.postDelayed({
                                 if (connected.get() && device?.address == settleAddress) {
                                     Log.d(TAG, "battery re-query after connect (+${delayMs}ms)")
