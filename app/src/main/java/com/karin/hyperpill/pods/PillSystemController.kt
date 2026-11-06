@@ -63,13 +63,19 @@ object PillSystemController {
      *
      * The answer the headset gives immediately after RFCOMM comes up is a stale snapshot of
      * the previous session: measured 01 5A 02 00 -> L=90, R=0 while both pods were full,
-     * turning into 01 64 02 64 about a second later. The system UI renders whatever it is
-     * handed first, so the focus island and the headset notification popped up showing the
-     * wrong pair of percentages and corrected themselves afterwards. Holding the readings
-     * for this window and publishing only the newest one turns that flicker into a single
-     * correct post.
+     * turning into 01 64 02 64 later. The system UI renders whatever it is handed first, so
+     * the focus island and the headset notification popped up showing the wrong pair of
+     * percentages and corrected themselves afterwards.
+     *
+     * Repeated connects showed the headset ramps up instead of jumping straight to the real
+     * level: right pod went 80 -> 90 -> 90 -> 90 -> 100, and the real pair only arrived
+     * between 1.5s and 4.0s after RFCOMM came up (1.5s, 3.1s and 4.0s in three consecutive
+     * captures). A single fixed deadline below that spread therefore published the stale
+     * level roughly half the time, which is what made the flicker come back in daily use.
+     * The deadline is now set above the observed worst case and the island simply appears a
+     * little later with the correct numbers, instead of appearing at once with a wrong pair.
      */
-    private const val BATTERY_SETTLE_MS = 1_400L
+    private const val BATTERY_SETTLE_MS = 5_000L
 
     /**
      * Packages the pod-state broadcasts are addressed to.
@@ -126,6 +132,12 @@ object PillSystemController {
 
     /** Newest reading captured during the settle window, published when the window closes. */
     private var pendingBattery: BatteryParams? = null
+
+    /** How many times the settle deadline was pushed back because nothing had answered yet. */
+    private var settleRetries = 0
+
+    /** Uptime of the current connect, used to timestamp frame diagnostics as +Nms. */
+    private var sessionStartMs = 0L
 
     private val handler = Handler(Looper.getMainLooper())
 
@@ -193,14 +205,16 @@ object PillSystemController {
         connected.set(true)
         registerReceiverIfNeeded()
 
-        // Hold the first battery readings: the frame the headset answers right after RFCOMM
-        // comes up is a stale snapshot of the previous session (L=90, R=0 while both pods
-        // were full). Publishing it made the focus island and the notification open with the
-        // wrong percentages and visibly correct themselves a second later. Readings are now
-        // staged for BATTERY_SETTLE_MS and only the newest one is published.
+        // Hold the first battery readings: the headset answers with a boot ramp (R=80 -> 90 ->
+        // 90 -> 100) and only reports the real level between 1.5s and 4.0s after RFCOMM comes
+        // up. Publishing the early answers made the focus island and the notification open
+        // with the wrong percentages and visibly correct themselves right after. The window
+        // itself is opened in onConnected(), because the ramp only starts once the socket is
+        // live; here the session is merely reset.
         pendingBattery = null
-        settleUntilMs = android.os.SystemClock.elapsedRealtime() + BATTERY_SETTLE_MS
-        handler.postDelayed({ flushPendingBattery() }, BATTERY_SETTLE_MS + 120L)
+        settleUntilMs = 0L
+        settleRetries = 0
+        sessionStartMs = android.os.SystemClock.elapsedRealtime()
 
         sendConnectedBroadcast(device)
 
@@ -215,6 +229,13 @@ object PillSystemController {
                 val c = PillClient(target, object : PillClient.Listener {
                     override fun onConnected() {
                         Log.diag("[Controller] RFCOMM connected ${target.address}, querying battery + config")
+                        // Open the settle window here: the pods only start ramping once the
+                        // socket is up, so the deadline has to count from this instant.
+                        val token = sessionStartMs
+                        pendingBattery = null
+                        settleRetries = 0
+                        settleUntilMs = android.os.SystemClock.elapsedRealtime() + BATTERY_SETTLE_MS
+                        handler.postDelayed({ flushPendingBattery(token) }, BATTERY_SETTLE_MS + 120L)
                         queryBattery()
                         queryConfig()
                         // The first battery frame after RFCOMM comes up is routinely a
@@ -225,7 +246,7 @@ object PillSystemController {
                         // read as "battery is wrong on first connect". Re-ask a few times
                         // over the next seconds so the real values land almost immediately.
                         val settleAddress = target.address
-                        listOf(400L, 900L, 1_300L).forEach { delayMs ->
+                        listOf(400L, 900L, 1_300L, 2_000L, 2_800L, 3_600L, 4_400L).forEach { delayMs ->
                             handler.postDelayed({
                                 if (connected.get() && device?.address == settleAddress) {
                                     Log.d(TAG, "battery re-query after connect (+${delayMs}ms)")
@@ -305,6 +326,7 @@ object PillSystemController {
         currentBattery = null
         pendingBattery = null
         settleUntilMs = 0L
+        settleRetries = 0
         if (receiverRegistered) {
             runCatching { oldContext?.unregisterReceiver(receiver) }
             receiverRegistered = false
@@ -455,6 +477,14 @@ object PillSystemController {
         val type = (command shr 7) and 0x03
         val feature = (command shr 9) and 0x7F
         val cmd = command and 0x7F
+        // TEMP DIAGNOSTIC: timestamp every battery-related frame so the settle behaviour can
+        // be traced against the query schedule. Every type is logged, including the pushes the
+        // response-only branch below drops.
+        if (feature == GaiaProtocol.FEATURE_BATTERY) {
+            val elapsed = if (sessionStartMs == 0L) 0L
+            else android.os.SystemClock.elapsedRealtime() - sessionStartMs
+            Log.diag("[Frame] +${elapsed}ms type=$type cmd=$cmd hex=${pdu.joinToString(":") { "%02X".format(it.toInt() and 0xFF) }}")
+        }
         if (type != GaiaProtocol.TYPE_RESPONSE) return
 
         if (feature == GaiaProtocol.FEATURE_BATTERY && cmd == GaiaProtocol.CMD_GET_BATTERY_LEVELS) {
@@ -570,20 +600,44 @@ object PillSystemController {
     }
 
     /** Publishes the freshest reading captured during the settle window, if any. */
-    private fun flushPendingBattery() {
+    private fun flushPendingBattery(token: Long) {
+        // A flush scheduled for a previous session must never publish into the current one.
+        if (token != sessionStartMs) return
         val held = pendingBattery
+        if (held == null) {
+            // Nothing answered inside the window. Keep holding instead of letting the next
+            // frame through unchecked, and look again shortly.
+            if (connected.get() && settleRetries < 4) {
+                settleRetries++
+                settleUntilMs = android.os.SystemClock.elapsedRealtime() + 1_200L
+                handler.postDelayed({ flushPendingBattery(token) }, 1_200L + 120L)
+                Log.diag("[Controller] settle window extended, no reading yet (retry $settleRetries)")
+                return
+            }
+            pendingBattery = null
+            settleUntilMs = 0L
+            settleRetries = 0
+            Log.diag("[Controller] settle window closed with no reading, giving up")
+            return
+        }
         pendingBattery = null
         settleUntilMs = 0L
-        if (held == null) return
+        settleRetries = 0
         if (!connected.get()) {
             Log.d(TAG, "settle window closed while disconnected, dropping held reading")
             return
         }
-        Log.d(
-            TAG,
-            "settle window closed, publishing L=${held.left?.battery ?: "--"} R=${held.right?.battery ?: "--"}"
+        Log.diag(
+            "[Controller] settle window closed, publishing L=${held.left?.battery ?: "--"} R=${held.right?.battery ?: "--"}"
         )
         publishBattery(held)
+        // The pods settle before the deadline in every capture so far, but a slow one would
+        // otherwise keep the wrong pair on screen until the 30s poll. Ask once more right
+        // after publishing so a late correction lands in seconds.
+        val verifyAddress = device?.address
+        handler.postDelayed({
+            if (connected.get() && device?.address == verifyAddress) queryBattery()
+        }, 1_500L)
     }
 
     private fun publishBattery(battery: BatteryParams) {
