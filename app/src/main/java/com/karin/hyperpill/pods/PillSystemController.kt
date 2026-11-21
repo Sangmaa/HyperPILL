@@ -2,6 +2,7 @@ package com.karin.hyperpill.pods
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -143,6 +144,26 @@ object PillSystemController {
     /** Uptime of the current connect, used to timestamp frame diagnostics as +Nms. */
     private var sessionStartMs = 0L
 
+    /**
+     * Backoff for re-opening a session that died while the headset stayed connected.
+     *
+     * The only reconnect trigger used to be the A2DP connection event. If the RFCOMM handshake
+     * failed while A2DP stayed up -- a socket still held by the previous session, a transient
+     * "no channels available", a SecurityException from a revoked permission -- nothing ever
+     * asked again: no frames, never a publish, so the headset notification and the focus island
+     * both stayed away for the whole time the pods remained connected, and everything came back
+     * only after the user put the pods away and connected them again. That is exactly the
+     * "今天既没有通知也没有灵动岛" report. The watchdog walks this list while the Bluetooth layer
+     * still reports the device as connected, then stands down and waits for the next event.
+     */
+    private val reconnectBackoffMs = listOf(3_000L, 6_000L, 12_000L, 24_000L, 45_000L)
+
+    /** How many watchdog reconnects were already spent on the current link. */
+    private var reconnectAttempts = 0
+
+    /** Invalidates a queued watchdog run when a newer session replaces it. */
+    private var reconnectToken = 0L
+
     private val handler = Handler(Looper.getMainLooper())
 
     /**
@@ -197,13 +218,23 @@ object PillSystemController {
 
     @Synchronized
     fun connect(context: Context, device: BluetoothDevice) {
+        // A connect driven by the Bluetooth stack means a fresh link, so the backoff the
+        // watchdog accumulated for the previous one no longer applies.
+        reconnectAttempts = 0
+        connectInternal(context, device)
+    }
+
+    @Synchronized
+    private fun connectInternal(context: Context, device: BluetoothDevice) {
         Log.diag("[Controller] connect() dev=${device.address} alreadyConnected=${connected.get()} current=${this.device?.address}")
         if (connected.get() && this.device?.address == device.address) {
             Log.diag("[Controller]   -> already connected, no-op")
             return
         }
         Log.diag("[Controller]   -> tearing down previous session before reconnect")
-        disconnectInternal()
+        // This attempt supersedes any watchdog run that is still queued.
+        reconnectToken++
+        disconnectInternal(scheduleRetry = false)
         this.context = context.applicationContext ?: context
         this.device = device
         connected.set(true)
@@ -281,6 +312,11 @@ object PillSystemController {
                 c.connect()
             } catch (t: Throwable) {
                 Log.diag("[Controller] RFCOMM connect FAILED: ${t.javaClass.simpleName}: ${t.message}", t)
+                // connected was set optimistically before the socket existed. Leaving it true
+                // here made every later connect() a no-op, so a single synchronous failure
+                // (revoked permission, no channels left) silenced the module until the user
+                // reconnected the pods by hand. Tear down and let the watchdog retry.
+                disconnectInternal()
             }
         }.apply {
             name = "HyperPILL-System-RFCOMM"
@@ -315,10 +351,10 @@ object PillSystemController {
             }
             return
         }
-        disconnectInternal(notifyDisconnect = true)
+        disconnectInternal(notifyDisconnect = true, scheduleRetry = false)
     }
 
-    private fun disconnectInternal(notifyDisconnect: Boolean = false) {
+    private fun disconnectInternal(notifyDisconnect: Boolean = false, scheduleRetry: Boolean = true) {
         Log.diag("[Controller] disconnectInternal notify=$notifyDisconnect (client=${client != null} connected=${connected.get()})")
         val oldContext = context
         val oldDevice = device
@@ -340,6 +376,56 @@ object PillSystemController {
         if (notifyDisconnect && oldDevice != null && oldContext != null) {
             sendDisconnectedBroadcast(oldContext, oldDevice.address, oldDevice)
         }
+        if (scheduleRetry) scheduleReconnect(oldContext, oldDevice)
+    }
+
+    /**
+     * True while the Bluetooth layer still considers [dev] connected on A2DP.
+     *
+     * The watchdog must not resurrect a session the user actually ended, so it only retries
+     * while the pods are still up. isConnected(profile) is the precise answer; the adapter-wide
+     * state is the fallback for builds where that overload is unavailable.
+     */
+    private fun bluetoothLinkAlive(dev: BluetoothDevice): Boolean =
+        runCatching { dev.isConnected(BluetoothProfile.A2DP) }.getOrElse {
+            runCatching {
+                val adapter = android.bluetooth.BluetoothAdapter.getDefaultAdapter()
+                adapter?.getProfileConnectionState(BluetoothProfile.A2DP) ==
+                    BluetoothProfile.STATE_CONNECTED
+            }.getOrDefault(false)
+        }
+
+    /**
+     * Re-opens the session a few times when it ended although the headset is still connected.
+     *
+     * Everything downstream of the RFCOMM socket -- battery, notification, focus island -- is
+     * produced only after a frame publishes, so a session that fails to come up silences the
+     * whole module even though audio keeps working over A2DP. Retrying here is what makes the
+     * failure self-heal instead of waiting for the user to reconnect the pods.
+     */
+    private fun scheduleReconnect(ctx: Context?, dev: BluetoothDevice?) {
+        if (ctx == null || dev == null) return
+        if (reconnectAttempts >= reconnectBackoffMs.size) {
+            Log.diag("[Controller] reconnect watchdog exhausted after $reconnectAttempts attempts, standing down")
+            return
+        }
+        val delay = reconnectBackoffMs[reconnectAttempts]
+        reconnectAttempts++
+        reconnectToken++
+        val token = reconnectToken
+        Log.diag("[Controller] reconnect watchdog queued attempt $reconnectAttempts in ${delay}ms for ${dev.address}")
+        handler.postDelayed({
+            if (token != reconnectToken) return@postDelayed
+            if (connected.get()) return@postDelayed
+            val stillConnected = bluetoothLinkAlive(dev)
+            if (!stillConnected) {
+                Log.diag("[Controller] reconnect watchdog stood down, ${dev.address} is no longer connected")
+                reconnectAttempts = 0
+                return@postDelayed
+            }
+            Log.diag("[Controller] reconnect watchdog firing attempt $reconnectAttempts for ${dev.address}")
+            connectInternal(ctx, dev)
+        }, delay)
     }
 
     private fun sendDisconnectedBroadcast(ctx: Context, address: String?, device: BluetoothDevice?) {
@@ -646,6 +732,9 @@ object PillSystemController {
 
     private fun publishBattery(battery: BatteryParams) {
         currentBattery = battery
+        // The link produced a real reading, so the watchdog's budget starts over.
+        reconnectAttempts = 0
+        reconnectToken++
         sendBatteryBroadcast(battery)
     }
 
